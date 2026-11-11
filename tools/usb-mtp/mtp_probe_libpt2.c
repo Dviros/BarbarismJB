@@ -832,6 +832,279 @@ static uint16_t p_param_count(Dev *d)
     return xfer(d, "post-abuse health", OC_GETSTORAGEIDS, 0, NULL, 1);
 }
 
+/* ------------------------------------------------------------------ */
+/* corpus v3 — the audit-directed decisive six (docs/MTP-AUDIT.md).    */
+/* Static RE facts they probe: 0x02FE/02FF synthesized BELOW capmtp by */
+/* the USB transport; the zombie is a designed cancel-latch ([ctx+1]=2 */
+/* at 0x1e960 on word0==0x4001), unlatch at 0x1eca0 EATS one command;  */
+/* CloseSession needs EXACT live txid + len 12 (clears session at      */
+/* 0x1f0c8); 9-slot transfer ring with %9 wrap and no push guard;      */
+/* unknown opcodes -> banded 0x1776E3/0x177EE3 with no container.      */
+
+/*
+ * v3-1 capture_02ff_container: latch the zombie (desync), fire
+ * GetStorageIDs, and CAPTURE THE FULL 12-BYTE response container RAW —
+ * no glue interpretation. The audit's decisive discriminator: the
+ * synthesized 0x2FF with type!=3 or txid!=echo-of-command means the
+ * synthesizer sits at the raw-transport layer (usbsys); type==3 with a
+ * correct echo means it mirrors the engine txid.
+ */
+static uint16_t p_capture_02ff(Dev *d)
+{
+    unsigned char resp[12];
+    unsigned char cmd[12];
+    uint32_t tx = d->params.transaction_id;
+    double t0;
+    int got;
+
+    (void)desync_getobject(d, "GetObject desync (02ff capture)", 1);
+    sleep(1);                              /* let the cancel-latch settle */
+
+    /* hand-built GetStorageIDs command so the txid we echo-check is
+     * exactly what we sent */
+    ((uint32_t *)cmd)[0] = 12;             /* length */
+    ((uint16_t *)cmd)[2] = 1;              /* type: COMMAND */
+    ((uint16_t *)cmd)[3] = OC_GETSTORAGEIDS;
+    ((uint32_t *)cmd)[2] = tx;             /* trans_id */
+    d->params.transaction_id++;
+    if (raw_bulk_write(d, cmd, 12) != 0) {
+        jr("op\":\"02ff-capture\",\"detail\":\"command write failed\"");
+        return PTP_RC_GeneralError;
+    }
+    t0 = now_ms();
+    got = raw_bulk_read(d, resp, 12, 8000);
+    if (got >= 12) {
+        jr("op\":\"02ff-capture\",\"len_field\":\"0x%08x\","
+           "\"type\":\"0x%04x\",\"code\":\"0x%04x\",\"txid_echo\":\"0x%08x\","
+           "\"sent_txid\":\"0x%08x\",\"ms\":%.2f",
+           ((uint32_t *)resp)[0], ((uint16_t *)resp)[2],
+           ((uint16_t *)resp)[3], ((uint32_t *)resp)[2], tx, now_ms() - t0);
+        if (((uint16_t *)resp)[3] == PTP_ERROR_IO) {
+            int type_ok = (((uint16_t *)resp)[2] == 3);
+            int echo_ok = (((uint32_t *)resp)[2] == tx);
+            jr("02ff_verdict\":\"synthesizer sits %s (type %s, txid %s)",
+               (!type_ok || !echo_ok)
+                   ? "at the RAW-TRANSPORT layer (usbsys)" 
+                   : "mirroring the ENGINE txid",
+               type_ok ? "=3 RESPONSE" : "!=3",
+               echo_ok ? "=echo" : "!=echo");
+        }
+    } else {
+        jr("op\":\"02ff-capture\",\"detail\":\"no 12-byte container "
+           "captured (engine silent AND transport silent)\","
+           "\"sent_txid\":\"0x%08x\",\"ms\":%.2f", tx, now_ms() - t0);
+    }
+    return RC_OK;
+}
+
+/*
+ * v3-2 session_id_abuse: OpenSession(4) and OpenSession(0x7FFFFFFF)
+ * (audit: both accepted — session id stored unvalidated in
+ * [1,0xFFFFFFFE]); ops still work; then the RECOVERY CANDIDATE:
+ * CloseSession with the EXACT live txid counter and len=12 — predicted
+ * 0x2001 + session cleared at 0x1f0c8. We track the txid faithfully and
+ * fire both interpretations of "live txid" (next-expected and last-seen).
+ */
+static uint16_t p_session_abuse(Dev *d)
+{
+    uint32_t s4 = 4, smax = 0x7FFFFFFFu;
+    uint16_t rc;
+    unsigned char c[12];
+    unsigned char resp[12];
+    int got;
+
+    rc = xfer(d, "OpenSession(4)", OC_OPENSESSION, 1, &s4, 0);
+    jr("session_abuse\":\"OpenSession(4) -> 0x%04x (audit: accepted, "
+       "unvalidated)", rc);
+    rc = xfer(d, "OpenSession(0x7FFFFFFF)", OC_OPENSESSION, 1, &smax, 0);
+    jr("session_abuse\":\"OpenSession(0x7FFFFFFF) -> 0x%04x", rc);
+    (void)xfer(d, "ops-still-work check", OC_GETSTORAGEIDS, 0, NULL, 1);
+
+    /* CloseSession, len=12 (Nparam=0), txid = next-expected then last-seen.
+     * After OpenSession the engine counter=1; our params->transaction_id
+     * has advanced past every valid op — journal the exact values used. */
+    {
+        uint32_t t_next = d->params.transaction_id;
+        uint32_t t_last = d->params.transaction_id - 1;
+        double t0;
+        int variant;
+
+        for (variant = 0; variant < 2; variant++) {
+            uint32_t t = variant ? t_last : t_next;
+            ((uint32_t *)c)[0] = 12;
+            ((uint16_t *)c)[2] = 1;
+            ((uint16_t *)c)[3] = OC_CLOSESESSION;
+            ((uint32_t *)c)[2] = t;
+            d->params.transaction_id = t + 1;
+            if (raw_bulk_write(d, c, 12) != 0) {
+                jr("session_abuse\":\"CloseSession(txid=0x%x) write failed",
+                   t);
+                continue;
+            }
+            t0 = now_ms();
+            got = raw_bulk_read(d, resp, 12, 5000);
+            if (got >= 12) {
+                jr("session_abuse\":\"CloseSession(len12,txid=0x%08x) -> "
+                   "len 0x%08x type 0x%04x CODE 0x%04x echo 0x%08x, "
+                   "%.2fms", t, ((uint32_t *)resp)[0],
+                   ((uint16_t *)resp)[2], ((uint16_t *)resp)[3],
+                   ((uint32_t *)resp)[2], now_ms() - t0);
+                if (((uint16_t *)resp)[3] == RC_OK)
+                    jr("session_abuse\":\"RECOVERY WORKED (0x2001, session "
+                       "cleared per audit 0x1f0c8)");
+            } else {
+                jr("session_abuse\":\"CloseSession(len12,txid=0x%08x) -> "
+                   "no container, %.2fms", t, now_ms() - t0);
+            }
+        }
+    }
+    return xfer(d, "post-abuse health", OC_GETSTORAGEIDS, 0, NULL, 1);
+}
+
+/*
+ * v3-3 zombie_alternation: latch the zombie, then GetDeviceInfo x10 with
+ * generous timeouts, journaling answered-vs-eaten per command. The
+ * 0x1eca0 unlatch-eats-one logic predicts ~alternating no-response.
+ */
+static uint16_t p_zombie_alternation(Dev *d)
+{
+    enum { N = 10 };
+    int i, answered = 0, eaten = 0;
+    (void)desync_getobject(d, "GetObject desync (alternation)", 1);
+    sleep(1);
+    for (i = 0; i < N; i++) {
+        double t0 = now_ms();
+        uint16_t rc = xfer(d, "alternation GetDeviceInfo", OC_GETDEVICEINFO,
+                           0, NULL, 1);
+        int was_eaten = (rc == PTP_ERROR_IO);
+        if (was_eaten) eaten++; else answered++;
+        jr("zombie_alternation\":{\"i\":%d,\"outcome\":\"%s\","
+           "\"resp_code\":\"0x%04x\",\"ms\":%.2f}",
+           i, was_eaten ? "EATEN" : "answered", rc, now_ms() - t0);
+    }
+    jr("zombie_alternation_summary\":\"%d answered / %d eaten — %s",
+       answered, eaten,
+       (eaten > 0 && answered > 0) ? "ALTERNATION PRESENT (unlatch-eats-one)"
+       : (eaten == N ? "all eaten" : "all answered"));
+    return RC_OK;
+}
+
+/*
+ * v3-4 cancel_injection — THE 2-BYTE REPRO: from a CLEAN state, send a
+ * hand-built container whose word0 reads 0x4001 to the event pump
+ * (length field = 0x00004001; type/code/txid zero) on the command pipe.
+ * Prediction: instant zombie from clean state, no data phase needed.
+ */
+static uint16_t p_cancel_injection(Dev *d)
+{
+    unsigned char c[12];
+    uint16_t health;
+    double t0 = now_ms();
+
+    memset(c, 0, sizeof(c));
+    ((uint32_t *)c)[0] = 0x00004001u;      /* word0 the pump matches */
+    if (raw_bulk_write(d, c, 12) != 0) {
+        jr("op\":\"cancel-injection\",\"detail\":\"write failed\"");
+        return PTP_RC_GeneralError;
+    }
+    jr("op\":\"cancel-injection\",\"detail\":\"word0=0x00004001 sent on "
+       "command pipe (type/code/txid zero)\",\"ms\":%.2f", now_ms() - t0);
+    /* health: if the latch took, GetStorageIDs dies */
+    health = xfer(d, "post-injection health", OC_GETSTORAGEIDS, 0, NULL, 1);
+    if (health != RC_OK)
+        jr("cancel_injection_verdict\":\"ZOMBIE LATCHED FROM CLEAN STATE "
+           "(2-byte repro confirmed, health 0x%04x)", health);
+    else
+        jr("cancel_injection_verdict\":\"no latch (health OK) — word0 "
+           "pattern alone insufficient\"");
+    return health;
+}
+
+/*
+ * v3-5 ring_saturation: two abandoned GetObject data phases back-to-back
+ * WITHOUT close (9-slot transfer ring, %9 wrap, no push guard at
+ * 0x24038): GetObject(h=1), consume only the 12-byte data header,
+ * GetObject(h=2), consume only its header, then health. Watch for a
+ * permanently-in-flight op. 10s cap per op.
+ */
+static uint16_t p_ring_saturation(Dev *d)
+{
+    unsigned char hdr[12];
+    int save_timeout = (int)d->ptp_usb->timeout;
+    double t0;
+    uint16_t health;
+
+    d->ptp_usb->timeout = 10000;           /* the 10s cap */
+    (void)desync_getobject(d, "GetObject(h=1) ring push #1", 1);
+    t0 = now_ms();
+    {
+        int got = raw_bulk_read(d, hdr, 12, 10000);
+        jr("ring_saturation\":\"push1 header read %s, %.2fms",
+           got >= 12 ? "ok" : "NOTHING", now_ms() - t0);
+    }
+    (void)desync_getobject(d, "GetObject(h=2) ring push #2", 2);
+    t0 = now_ms();
+    {
+        int got = raw_bulk_read(d, hdr, 12, 10000);
+        jr("ring_saturation\":\"push2 header read %s, %.2fms",
+           got >= 12 ? "ok" : "NOTHING", now_ms() - t0);
+    }
+    t0 = now_ms();
+    health = xfer(d, "ring health (in-flight check)", OC_GETSTORAGEIDS, 0,
+                  NULL, 1);
+    jr("ring_saturation\":\"health 0x%04x, %.2fms — %s", health,
+       now_ms() - t0,
+       health == RC_OK ? "ring drained" :
+       "OP NEVER COMPLETES (permanently in-flight — record-loss state)");
+    d->ptp_usb->timeout = save_timeout;
+    return health;
+}
+
+/*
+ * v3-6 banded_unknowns_zombie: latch the zombie, then send
+ * 0x1000 / 0x100B / 0x9801 / 0xFFFF with fresh txids. Differing canned
+ * codes = the transport maps the engine's error bands (0x1776E3 vs
+ * 0x177EE3); identical 0x2FF = the transport ignores them.
+ */
+static uint16_t p_banded_unknowns(Dev *d)
+{
+    static const uint16_t ops[] = { 0x1000, 0x100B, 0x9801, 0xFFFF };
+    unsigned char resp[12];
+    int i;
+
+    (void)desync_getobject(d, "GetObject desync (banded unknowns)", 1);
+    sleep(1);
+    for (i = 0; i < 4; i++) {
+        unsigned char c[12];
+        uint32_t tx = d->params.transaction_id++;
+        double t0 = now_ms();
+        int got;
+        ((uint32_t *)c)[0] = 12;
+        ((uint16_t *)c)[2] = 1;
+        ((uint16_t *)c)[3] = ops[i];
+        ((uint32_t *)c)[2] = tx;
+        if (raw_bulk_write(d, c, 12) != 0) {
+            jr("banded_unknown\":{\"op\":\"0x%04x\",\"detail\":\"write "
+               "failed\"", ops[i]);
+            continue;
+        }
+        got = raw_bulk_read(d, resp, 12, 5000);
+        if (got >= 12) {
+            jr("banded_unknown\":{\"op\":\"0x%04x\",\"len\":\"0x%08x\","
+               "\"type\":\"0x%04x\",\"code\":\"0x%04x\",\"ms\":%.2f}",
+               ops[i], ((uint32_t *)resp)[0], ((uint16_t *)resp)[2],
+               ((uint16_t *)resp)[3], now_ms() - t0);
+        } else {
+            jr("banded_unknown\":{\"op\":\"0x%04x\",\"outcome\":\"EATEN\","
+               "\"ms\":%.2f}", ops[i], now_ms() - t0);
+        }
+    }
+    jr("banded_unknowns_verdict\":\"compare codes above: differing = "
+       "transport maps engine error bands; identical = transport ignores "
+       "them\"");
+    return RC_OK;
+}
+
 static void corpus_init(void)
 {
     if (n_probes) return;
@@ -855,6 +1128,13 @@ static void corpus_init(void)
     reg("length_lie_cmd", p_length_lie);
     reg("zombie_window", p_zombie_window);
     reg("param_count_abuse", p_param_count);
+    /* corpus v3 (audit-directed decisive six — docs/MTP-AUDIT.md) */
+    reg("capture_02ff_container", p_capture_02ff);
+    reg("session_id_abuse", p_session_abuse);
+    reg("zombie_alternation", p_zombie_alternation);
+    reg("cancel_injection", p_cancel_injection);
+    reg("ring_saturation", p_ring_saturation);
+    reg("banded_unknowns_zombie", p_banded_unknowns);
 }
 
 
@@ -1053,9 +1333,9 @@ static int self_test(void)
 {
     int ok = 1;
     corpus_init();
-    printf("  %-48s %s\n", "corpus v2 size (v1 14 + v2 5)",
-           n_probes == 19 ? "PASS" : "FAIL");
-    ok &= (n_probes == 19);
+    printf("  %-48s %s\n", "corpus v3 size (v1 14 + v2 5 + v3 6)",
+           n_probes == 25 ? "PASS" : "FAIL");
+    ok &= (n_probes == 25);
     printf("  %-48s %s\n", "opcode values",
            (OC_GETTHUMB == 0x100a && OC_GETOBJECT == 0x1009 &&
             OC_GETHANDLES == 0x1007) ? "PASS" : "FAIL");
@@ -1081,6 +1361,20 @@ static int self_test(void)
            strcmp(PROBES[16].name, "length_lie_cmd") == 0 &&
            strcmp(PROBES[17].name, "zombie_window") == 0 &&
            strcmp(PROBES[18].name, "param_count_abuse") == 0);
+    printf("  %-48s %s\n", "v3 additions registered",
+           (strcmp(PROBES[19].name, "capture_02ff_container") == 0 &&
+            strcmp(PROBES[20].name, "session_id_abuse") == 0 &&
+            strcmp(PROBES[21].name, "zombie_alternation") == 0 &&
+            strcmp(PROBES[22].name, "cancel_injection") == 0 &&
+            strcmp(PROBES[23].name, "ring_saturation") == 0 &&
+            strcmp(PROBES[24].name, "banded_unknowns_zombie") == 0)
+           ? "PASS" : "FAIL");
+    ok &= (strcmp(PROBES[19].name, "capture_02ff_container") == 0 &&
+           strcmp(PROBES[20].name, "session_id_abuse") == 0 &&
+           strcmp(PROBES[21].name, "zombie_alternation") == 0 &&
+           strcmp(PROBES[22].name, "cancel_injection") == 0 &&
+           strcmp(PROBES[23].name, "ring_saturation") == 0 &&
+           strcmp(PROBES[24].name, "banded_unknowns_zombie") == 0);
     printf("mtp_probe_libpt2 self-test: %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }
@@ -1092,8 +1386,9 @@ static void usage(void)
         "--list | --self-test\n"
         "                    --probe-zombie-recovery "
         "[--runs-dir DIR] [--wait SEC]\n"
-        "corpus: v1 (14, == mtp_probe.py) + v2 (5: midstream_inject, "
-        "double_desync, length_lie_cmd, zombie_window, param_count_abuse)\n");
+        "corpus: v1 (14, == mtp_probe.py) + v2 (5) + v3 (6, audit-directed:\n"
+        "  capture_02ff_container, session_id_abuse, zombie_alternation,\n"
+        "  cancel_injection, ring_saturation, banded_unknowns_zombie)\n");
 }
 
 int main(int argc, char **argv)
