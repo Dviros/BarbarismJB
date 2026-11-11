@@ -108,7 +108,7 @@ APPLET_UA_MARK = "WifiWebAuthApplet"
 # applet strike kit pages (tools/webkit-rig/pages/*.html at the TOP level
 # only; pages/parked/*.html never register). data.page markers the
 # telemetry watcher journals as page_report events
-KIT_PAGES = ("capsweep", "wsagent", "fontchain")
+KIT_PAGES = ("capsweep", "wsagent", "fontchain", "pngztxt", "freeze", "webp4863")
 # what counts as "ours" when reaping stale rig listeners: the service
 # scripts themselves or the launcher (its name appears in sudo-spawned
 # children of a crashed prior session)
@@ -781,6 +781,35 @@ def kit_page_summary(page: str, data: dict) -> dict:
                 "p3": (data.get("p3") or {}).get("verdict"),
                 "priorCrash": gate.get("priorCrash"),
                 "errors": len(data.get("errors") or [])}
+    if page == "pngztxt":
+        gate = data.get("gate") or {}
+        return {"verdict": data.get("verdict"),
+                "effectivePhase": gate.get("effectivePhase"),
+                "p1": (data.get("p1") or {}).get("verdict"),
+                "p2": (data.get("p2") or {}).get("verdict"),
+                "priorCrash": gate.get("priorCrash"),
+                "errors": len(data.get("errors") or [])}
+    if page == "freeze":
+        gate = data.get("gate") or {}
+        return {"verdict": data.get("verdict"),
+                "effectivePhase": gate.get("effectivePhase"),
+                "syntax": data.get("syntax"),
+                "p1": (data.get("p1") or {}).get("verdict"),
+                "p2": (data.get("p2") or {}).get("verdict"),
+                "priorCrash": gate.get("priorCrash"),
+                "errors": len(data.get("errors") or [])}
+    if page == "webp4863":
+        gate = data.get("gate") or {}
+        asset = data.get("asset") or {}
+        load = data.get("load") or {}
+        return {"verdict": data.get("verdict"),
+                "rigPhase": gate.get("rigPhase"),
+                "assetStaged": asset.get("staged"),
+                "loadOutcome": load.get("outcome"),
+                "naturalWxH": [load.get("naturalW"), load.get("naturalH")],
+                "decodeOk": load.get("decodeOk"),
+                "priorCrash": gate.get("priorCrash"),
+                "errors": len(data.get("errors") or [])}
     return {}
 
 
@@ -1311,7 +1340,8 @@ def self_test() -> int:
 
         # (d2) applet strike kit pages: served at /page/<name>, templated,
         # script parses; capsweep must also be swappable onto /portal
-        for page_name in ("capsweep", "wsagent", "fontchain"):
+        for page_name in ("capsweep", "wsagent", "fontchain", "pngztxt",
+                          "freeze", "webp4863"):
             if page_name not in cfg.pages:
                 check("(d2) %s registered from pages/" % page_name, False,
                       "cfg.pages=%s" % sorted(cfg.pages))

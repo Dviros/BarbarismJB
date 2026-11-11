@@ -111,7 +111,7 @@ copied PoC (we have none) — see its header comment and
 variant errored before comparison); it is NOT clean — re-run with the
 applet open longer before drawing conclusions.
 
-### Applet strike kit (pages/ — capsweep, wsagent, fontchain; pages/parked/ is dead)
+### Applet strike kit (pages/ — capsweep, wsagent, fontchain, pngztxt, freeze, webp4863; pages/parked/ is dead)
 
 `tools/webkit-rig/pages/` holds the strike kit: every top-level `*.html`
 in it is auto-registered by filename stem at portal.py startup (same
@@ -243,6 +243,68 @@ memoryBefore/After}`; verdicts `ARITHMETIC-CLEAN`,
 `LADDER-COMPLETE/CLEAN/DIVERGENCE@N`, `ABORTED-BUDGET-AT-N`,
 `BUDGET-TOO-SMALL`, `LADDER-TIME-CUT`, `PRIOR-RUN-CRASHED`.
 **PARKED — see the block above.**
+
+**pngztxt.html — libpng compressed-ancillary-chunk oracle (CVE-2026-46675
+class), phased.** The applet ships libpng 1.6.57 (docs/NDAYS-C-TIER.md
+verdict 1); the zTXt/iCCP/iTXt read-after-free is fixed only in 1.6.59 —
+one crafted PNG through `<img>` is the whole trigger surface. Delivery:
+the page loads `<img>` tags from the rig's own PNG crafter
+`GET /rig/png/ztxt?mode=N&seed=N` (portal.py, stdlib zlib; canvas is
+never used — it re-encodes and would destroy the chunk framing). Phase 1
+(default, SAFE): modes 0-3 (baseline, well-formed zTXt/iCCP/iTXt) —
+load/error events, naturalWidth/Height, decode() timing: proves the
+compressed-chunk code path executes WITHOUT attacking it
+(`PARSE-PATH-LIVE`). Phase 2 (+gate): modes 10-16 — truncated zlib
+streams, chunk length past EOF, ~1MiB iCCP profile, empty compressed
+data, bad CRC — REPEATS per mode with distinct seeds, armed-marker per
+mode, crash-suffix oracle; the crafter ALSO refuses malformed modes
+below phase 2 server-side (403 `E_PHASE_GATE`), so the shapes cannot be
+fetched even with the page open. Phase 3 (+gate): reserved (heap
+grooming around the freed zlib stream). Telemetry: `p1.images[]`,
+`p2.rounds[]` with per-image `{mode, seed, outcome, naturalW/H,
+decodeMs, totalMs}`; verdicts `PARSE-PATH-LIVE`, `CHUNK-REJECTED`,
+`MALFORMED-SURVIVED`, `PRIOR-RUN-CRASHED`.
+
+**freeze.html — freeze/seal-on-private-fields structure oracle
+(CVE-2026-20608), phased.** The LIVE pure-interpreter chain verified in
+our tree (docs/NDAYS-V2.md row 2): `ObjectConstructor.cpp:785-788`
+fast-path freeze → `JSObject.cpp:2616-2621` → `Structure.cpp:844-853`
+attribute loop ORs DontDelete+ReadOnly onto EVERY property-table entry
+with no private-name exclusion (the `isPrivateName()` idiom exists at
+`:1367` but is not consulted), and the corrupted structure is cached as
+a reusable transition at `:866-874`. Phase 1 (default, SAFE):
+behavioral oracle only — classes with 1/2/4/8 private fields,
+`Object.freeze(this)` in constructors, instance-order matrices
+(freeze-first/freeze-last/interleaved, 48 instances per run) exercising
+get/set/`#x in`/defineProperty/delete; reports any OBSERVABLE attribute
+desync (frozen-ness asymmetry between instances — the cached-transition
+symptom —, private-field write inconsistency, exception text); a crash
+is not expected or required. Phase 2 (+gate): structure-spray
+escalation — 24 distinct class shapes per round (unique field
+counts/orders via `new Function` factories), freeze-mid-method variants,
+transition-table reuse patterns (property churn → freeze → late
+instances that must reuse the corrupted transition); armed-marker per
+round, progress telemetry. Phase 3 (+gate): reserved (property-offset
+confusion probes). Telemetry: `syntax`, `p1.runs[]` (per-instance
+observation matrices), `p2.rounds[]`; verdicts `CONSISTENT-FROZEN`,
+`DESYNC(n)`, `SPRAY-CLEAN`, `SPRAY-DESYNC(n)`, `UNSUPPORTED`,
+`PRIOR-RUN-CRASHED`.
+
+**webp4863.html — libwebp CVE-2023-4863 one-shot status probe,
+gate-required from the start.** The applet's libwebp version is
+unpinnable statically (the decoder ABI check compiled away the minor
+version — docs/NDAYS-C-TIER.md verdict 2); if it is < 1.3.2,
+BuildHuffmanTable is a contiguous heap OOB write with fully
+attacker-controlled bytes. Unlike every other kit page there is NO free
+phase: the single `<img>` load of a staged public-PoC-class lossless
+WebP (`/stage/webp4863.webp` — absent → clean `SKIPPED-NO-ASSET`, like
+fontchain's crafted font) runs ONLY at rig phase >= 2 (the same
+deliberate `/rig/phase` opt-in that arms the other pages' phase 2);
+below that it reports `SKIPPED-GATED`. Armed-marker before the load; the
+load itself is fully instrumented (naturalWidth/Height, decode() timing,
+error outcome). If the load crashes the applet, the armed marker reports
+`PRIOR-RUN-CRASHED` on the next load — that crash IS the verdict and
+everything after is manual. No further phases by design.
 
 **fontchain.html — CSSFontFace::setStatus UAF harness (CVE-2026-43715
 class), PHASED and SAFE by default.** Built from the publicly documented

