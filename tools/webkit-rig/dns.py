@@ -37,7 +37,9 @@ Stdlib only. Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import logging
+import os
 import re
 import socket
 import struct
@@ -45,6 +47,7 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime, timezone
 
 LOG = logging.getLogger("rig.dns")
 
@@ -145,14 +148,28 @@ def is_known(name: str, mode: str, zones: tuple) -> bool:
 
 
 def respond(data: bytes, ip: str, mode: str, zones: tuple,
-            log=LOG.debug) -> bytes:
+            log=LOG.debug, sink=None, client=None, proto=None) -> bytes:
     """Build the response for one raw query. Never raises: every failure
-    maps to a coded response (FORMERR when even the ID is unreadable)."""
+    maps to a coded response (FORMERR when even the ID is unreadable).
+    sink, when given, receives one structured record per query: {ts,
+    client, proto, qname, qtype, verdict, answer, rcode} — appended+
+    flushed by the caller's sink so the query log survives a crash."""
+    def record(qname, qtype, verdict, answer, rcode):
+        if sink is None:
+            return
+        try:
+            sink({"ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+                  "client": client, "proto": proto, "qname": qname,
+                  "qtype": qtype, "verdict": verdict, "answer": answer,
+                  "rcode": rcode})
+        except Exception:
+            pass                      # the sink must never break answering
     try:
         hdr = _parse_header(data)
     except DnsError as e:
         qid = struct.unpack("!H", data[:2])[0] if len(data) >= 4 else 0
         log("FORMERR %s (%s)", data[:24].hex(), e)
+        record(None, None, "FORMERR", None, e.rcode)
         return _build_response(qid, False, 0, b"", e.rcode, [])
     try:
         if hdr["opcode"] != 0:
@@ -163,22 +180,27 @@ def respond(data: bytes, ip: str, mode: str, zones: tuple,
         if q["qclass"] != QCLASS_IN:
             verdict = "REFUSED class=%d" % q["qclass"]
             resp = _build_response(hdr["id"], hdr["rd"], 0, q["raw"], RCODE_REFUSED, [])
+            record(q["name"], q["type"], "REFUSED", None, RCODE_REFUSED)
         elif q["type"] == QTYPE_A and is_known(q["name"], mode, zones):
             verdict = "A %s -> %s" % (q["name"], ip)
             resp = _build_response(hdr["id"], hdr["rd"], 0, q["raw"],
                                    RCODE_NOERROR, [socket.inet_aton(ip)])
+            record(q["name"], q["type"], "A", ip, RCODE_NOERROR)
         elif q["type"] == QTYPE_A:
             verdict = "NXDOMAIN %s" % q["name"]
             resp = _build_response(hdr["id"], hdr["rd"], 0, q["raw"], RCODE_NXDOMAIN, [])
+            record(q["name"], q["type"], "NXDOMAIN", None, RCODE_NXDOMAIN)
         else:
             # Non-A on any name: NOERROR with zero answers so the caller
             # falls back to A (bench-verified behavior for AAAA et al).
             verdict = "NOERROR-0 %s type=%d" % (q["name"], q["type"])
             resp = _build_response(hdr["id"], hdr["rd"], 0, q["raw"], RCODE_NOERROR, [])
+            record(q["name"], q["type"], "NOERROR-0", None, RCODE_NOERROR)
         log("%s", verdict)
         return resp
     except DnsError as e:
         log("FORMERR id=%04x (%s)", hdr["id"], e)
+        record(None, None, "FORMERR", None, e.rcode)
         return _build_response(hdr["id"], hdr["rd"], 0, b"", e.rcode, [])
 
 
@@ -186,11 +208,28 @@ def respond(data: bytes, ip: str, mode: str, zones: tuple,
 # Server (UDP + TCP on one port)
 # ---------------------------------------------------------------------------
 
+def jsonl_query_sink(path: str):
+    """Append+flush one JSON line per query to `path` (crash-safe query
+    log). Returns a sink callable for DnsServer/respond."""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    fh = open(path, "a", encoding="utf-8")
+    lock = threading.Lock()
+
+    def sink(rec: dict) -> None:
+        line = json.dumps(rec, separators=(",", ":")) + "\n"
+        with lock:
+            fh.write(line)
+            fh.flush()
+    return sink
+
+
 class DnsServer:
     def __init__(self, bind: str, port: int, ip: str, mode: str = "conntest",
-                 zones: tuple = DEFAULT_ZONES, logger: logging.Logger = LOG):
+                 zones: tuple = DEFAULT_ZONES, logger: logging.Logger = LOG,
+                 query_sink=None):
         self.bind, self.port, self.ip, self.mode, self.zones = bind, port, ip, mode, tuple(zones)
         self.log = logger
+        self.query_sink = query_sink
         self._udp = self._tcp = None
         self._threads: list[threading.Thread] = []
         self._running = False
@@ -238,7 +277,8 @@ class DnsServer:
             # console traffic again.
             def verdict(fmt, *args, _client=addr[0]):
                 self.log.info("udp %s " + fmt, _client, *args)
-            resp = respond(data, self.ip, self.mode, self.zones, verdict)
+            resp = respond(data, self.ip, self.mode, self.zones, verdict,
+                           sink=self.query_sink, client=addr[0], proto="udp")
             try:
                 self._udp.sendto(resp, addr)
             except OSError:
@@ -269,7 +309,8 @@ class DnsServer:
                 data = self._recv_exact(conn, n)
                 if not data:
                     return
-                resp = respond(data, self.ip, self.mode, self.zones, verdict)
+                resp = respond(data, self.ip, self.mode, self.zones, verdict,
+                               sink=self.query_sink, client=addr[0], proto="tcp")
                 conn.sendall(struct.pack("!H", len(resp)) + resp)
         except (OSError, socket.timeout):
             pass
@@ -517,6 +558,10 @@ def main(argv=None) -> int:
                     help="extra suffix zone to answer (repeatable); stacked on the defaults")
     ap.add_argument("--no-default-zones", action="store_true",
                     help="drop the default savanna/idobata suffix zones")
+    ap.add_argument("--log-jsonl", metavar="PATH", default=None,
+                    help="append one JSON line per query to PATH (append+flush; "
+                         "crash-safe structured query log: ts/client/proto/"
+                         "qname/qtype/verdict/answer/rcode)")
     ap.add_argument("--self-test", action="store_true", help="run offline self-test and exit")
     args = ap.parse_args(argv)
 
@@ -530,8 +575,12 @@ def main(argv=None) -> int:
         print("warning: %s is not a LAN IP; the console will not reach it" % ip, file=sys.stderr)
     zones = tuple(args.zone) if args.no_default_zones else DEFAULT_ZONES + tuple(args.zone)
     bind = args.bind or ip
+    sink = jsonl_query_sink(args.log_jsonl) if args.log_jsonl else None
+    if sink:
+        print("query log: %s (jsonl, append+flush)" % args.log_jsonl, flush=True)
     try:
-        srv = DnsServer(bind, args.port, ip, args.mode, zones).start()
+        srv = DnsServer(bind, args.port, ip, args.mode, zones,
+                        query_sink=sink).start()
     except PermissionError:
         print("error: cannot bind %s:%d (E_PERM); use sudo, or a high --port for offline tests"
               % (bind, args.port), file=sys.stderr)

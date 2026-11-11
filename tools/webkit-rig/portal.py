@@ -112,6 +112,108 @@ WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"  # RFC 6455 magic
 MAX_WS_FRAME_BYTES = 1 << 20        # 1 MiB frame cap (matches /report)
 MAX_PHASE = 3                       # fontchain gate: 1 trigger-only .. 3 arb-read stub
 
+# /rig/live dashboard: one self-contained page, no external deps, polls
+# /rig/live/feed?since=<seq> every second (status + ring + verdict panel).
+LIVE_HTML = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rig live</title>
+<style>
+ html,body{margin:0;padding:0;background:#101318;color:#e8eaf0;font-family:sans-serif}
+ #wrap{max-width:1100px;margin:18px auto;padding:0 14px}
+ h1{font-size:20px;margin:0 0 10px} .muted{color:#8f9ab3;font-size:12px}
+ #strip{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px}
+ .cell{background:#1a1f2b;border:1px solid #2c3446;border-radius:8px;
+       padding:6px 12px;font-size:13px}
+ .cell b{color:#9fb0d8;font-weight:normal;display:block;font-size:11px}
+ .ok{color:#7fd6a8}.warn{color:#e8b44a}.bad{color:#e2705e}
+ #cols{display:grid;grid-template-columns:2fr 1fr;gap:12px}
+ @media(max-width:800px){#cols{grid-template-columns:1fr}}
+ .panel{background:#1a1f2b;border:1px solid #2c3446;border-radius:8px;padding:10px}
+ .panel h2{font-size:12px;color:#8f9ab3;margin:0 0 8px;text-transform:uppercase}
+ #events{max-height:420px;overflow-y:auto;font:11.5px/1.5 monospace}
+ #events div{border-bottom:1px dashed #222a3a;padding:1px 2px;white-space:nowrap}
+ .k{color:#9fb0d8}.s{color:#cfe3ff}
+ #verdicts{font:12px/1.7 monospace}
+ #verdicts .pg{margin-bottom:8px}.pg b{color:#9fb0d8;font-weight:normal}
+ label{font-size:12px;color:#8f9ab3}
+</style></head><body><div id="wrap">
+<h1>rig live <span class="muted" id="rigtag"></span></h1>
+<div id="strip">
+ <div class="cell"><b>uptime</b><span id="s-uptime">-</span></div>
+ <div class="cell"><b>phase gate</b><span id="s-phase">-</span></div>
+ <div class="cell"><b>/portal serves</b><span id="s-serving">-</span></div>
+ <div class="cell"><b>ws agent</b><span id="s-agent">-</span></div>
+ <div class="cell"><b>console first-seen</b><span id="s-console">-</span></div>
+</div>
+<div id="cols">
+ <div class="panel"><h2>events (newest last)</h2>
+   <label><input type="checkbox" id="autoscroll" checked> auto-scroll</label>
+   <div id="events"></div></div>
+ <div class="panel"><h2>page verdicts</h2><div id="verdicts">-</div></div>
+</div>
+<div class="muted">read-only; polls /rig/live/feed every 1s</div>
+</div>
+<script>
+var seq = 0, evEl = document.getElementById("events");
+function $(id){return document.getElementById(id);}
+function clsFor(kind){
+  if (kind === "applet_entry" || kind === "ws_agent") return "ok";
+  if (kind === "phase_gate" || kind === "swap") return "warn";
+  if (kind.indexOf("crash") !== -1 || kind === "ws_eval") return "warn";
+  return "";
+}
+function render(d){
+  var st = d.status || {};
+  $("s-uptime").textContent = st.uptimeSec != null ? st.uptimeSec + "s" : "-";
+  $("s-phase").textContent = st.phase != null ? st.phase : "-";
+  $("s-serving").textContent = st.serving || "-";
+  var a = $("s-agent");
+  a.textContent = st.wsAgent ? ("UP " + (st.wsAgentPeer || "?")) : "down";
+  a.className = st.wsAgent ? "ok" : "bad";
+  $("s-console").textContent = st.console
+      ? (st.console.peer + " @ " + String(st.console.ts).slice(11, 19)) : "-";
+  $("rigtag").textContent = st.rig || "";
+  var evs = d.events || [];
+  for (var i = 0; i < evs.length; i++) {
+    var e = evs[i];
+    var row = document.createElement("div");
+    var t = document.createElement("span");
+    t.className = "k";
+    t.textContent = String(e.ts).slice(11, 19) + " " + e.kind + " [" + e.peer + "] ";
+    row.appendChild(t);
+    var s = document.createElement("span");
+    s.className = "s " + clsFor(e.kind);
+    s.textContent = e.summary || "";
+    row.appendChild(s);
+    evEl.appendChild(row);
+  }
+  if (evs.length && $("autoscroll").checked) { evEl.scrollTop = evEl.scrollHeight; }
+  var pages = st.pages || {}, html = "", k;
+  for (k in pages) {
+    if (!pages.hasOwnProperty(k)) continue;
+    var p = pages[k];
+    html += '<div class="pg"><b>' + k + '</b><br>phase ' + (p.phase || "?") +
+        " &middot; " + (p.verdict || (p.effectivePhase != null
+            ? "eff.phase " + p.effectivePhase : "?")) +
+        '<br><span class="muted">' + String(p.ts).slice(11, 19) + "</span></div>";
+  }
+  $("verdicts").innerHTML = html || "-";
+  seq = d.seq;
+}
+function tick(){
+  try {
+    fetch("/rig/live/feed?since=" + seq)
+      .then(function (r) { return r.json(); })
+      .then(render)
+      .catch(function () {});
+  } catch (e) {}
+}
+tick();
+setInterval(tick, 1000);
+</script></body></html>
+"""
+
 CONTENT_TYPES = {
     ".html": "text/html; charset=utf-8",
     ".js": "text/javascript; charset=utf-8",
@@ -278,15 +380,31 @@ class WsSession:
         self.alive = True
         self.conn_id = hub.next_conn_id()
 
+    def _log_frame(self, direction: str, op: int, payload: bytes) -> None:
+        hub = self.hub
+        if hub.frame_sink is None:
+            return
+        try:
+            hub.frame_sink({
+                "ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+                "dir": direction,          # "in" (peer->rig) | "out" (rig->peer)
+                "role": self.role, "peer": self.peer,
+                "opcode": op, "size": len(payload),
+                "preview": payload[:512].decode("utf-8", "replace")})
+        except Exception:
+            pass                          # frame logging must never break I/O
+
     def send_json(self, obj: dict) -> bool:
         return self.send_text(json.dumps(obj, separators=(",", ":")))
 
     def send_text(self, text: str) -> bool:
         if not self.alive:
             return False
+        payload = text.encode("utf-8")
         try:
             with self.wlock:
-                self.sock.sendall(ws_encode_frame(WS_OP_TEXT, text.encode("utf-8")))
+                self.sock.sendall(ws_encode_frame(WS_OP_TEXT, payload))
+            self._log_frame("out", WS_OP_TEXT, payload)
             return True
         except OSError:
             self.alive = False
@@ -312,9 +430,11 @@ class WsSession:
             while self.alive:
                 fin, op, data = ws_read_frame(self.sock)
                 if op == WS_OP_CLOSE:
+                    self._log_frame("in", WS_OP_CLOSE, data)
                     self.close(struct.unpack(">H", data[:2])[0] if len(data) >= 2 else 1000)
                     return
                 if op == WS_OP_PING:
+                    self._log_frame("in", WS_OP_PING, data)
                     with self.wlock:
                         self.sock.sendall(ws_encode_frame(WS_OP_PONG, data))
                     continue
@@ -324,12 +444,14 @@ class WsSession:
                     if not fin:                     # start of fragmentation
                         frag_op, frag_buf = op, data
                         continue
+                    self._log_frame("in", op, data)
                     self.hub.on_message(self, op, data)
                 elif op == WS_OP_CONT and frag_op is not None:
                     frag_buf += data
                     if len(frag_buf) > MAX_WS_FRAME_BYTES:
                         raise ConnectionError("fragmented message over cap")
                     if fin:
+                        self._log_frame("in", frag_op, frag_buf)
                         self.hub.on_message(self, frag_op, frag_buf)
                         frag_op, frag_buf = None, b""
                 else:
@@ -352,16 +474,25 @@ class WsHub:
     {id, code}; the agent (wsagent.html on the console) evaluates and replies
     {id, ok, result|error, elapsed}; replies route back to the origin."""
 
-    def __init__(self):
+    def __init__(self, frame_sink=None, on_event=None):
         self._lock = threading.Lock()
         self._conn_seq = 0
         self._msg_seq = 0
+        self.frame_sink = frame_sink          # RigConfig.append_ws_frame
+        self.on_event = on_event              # RigConfig._ws_live_event
         self.agent: WsSession | None = None
         self.controllers: dict[int, WsSession] = {}
         self.pending: dict[str, int] = {}           # msg id -> conn_id
         self.counters = {"agent_msgs": 0, "agent_replies": 0, "console_msgs": 0,
                          "forwards": 0, "heartbeats": 0, "dropped": 0}
         self.events: deque[dict] = deque(maxlen=200)
+
+    def live(self, kind: str, peer: str, summary: str) -> None:
+        if self.on_event:
+            try:
+                self.on_event(kind, peer, summary)
+            except Exception:
+                pass
 
     def next_conn_id(self) -> int:
         with self._lock:
@@ -397,6 +528,10 @@ class WsHub:
             old.close(1008)
         self.event("open", peer=sess.peer, role=sess.role, conn=sess.conn_id)
         if sess.role == "agent":
+            self.live("ws_agent", sess.peer, "agent connected")
+        elif sess.role == "console":
+            self.live("ws_console", sess.peer, "console attached")
+        if sess.role == "agent":
             sess.send_json({"t": "welcome", "agent": True})
         elif sess.role == "probe":
             sess.send_json({"t": "welcome", "probe": True})
@@ -408,6 +543,8 @@ class WsHub:
                 self.agent = None
             self.controllers.pop(sess.conn_id, None)
         self.event("close", peer=sess.peer, role=sess.role, conn=sess.conn_id)
+        if sess.role == "agent":
+            self.live("ws_agent", sess.peer, "agent disconnected")
 
     def on_message(self, sess: WsSession, op: int, data: bytes) -> None:
         if op != WS_OP_TEXT:
@@ -452,6 +589,9 @@ class WsHub:
             event_kw["result_prefix"] = (json.dumps(result)[:200]
                                          if result is not None else None)
         self.event("reply", **event_kw)
+        self.live("ws_eval", sess.peer,
+                  "eval#%s %s %sms" % (mid, "ok" if msg.get("ok") else "ERR",
+                                       msg.get("elapsed")))
         delivered = 0
         for target in targets:
             if target.send_json(msg):
@@ -510,10 +650,24 @@ class RigConfig:
         os.makedirs(runs_dir, exist_ok=True)
         os.makedirs(stage_dir, exist_ok=True)
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        self.started_at = datetime.now(timezone.utc)
         self.runs_path = os.path.join(runs_dir, "rig-%s.jsonl" % stamp)
         self._runs_file = open(self.runs_path, "a", encoding="utf-8")
         self._runs_lock = threading.Lock()
         self._writes_since_check = 0
+        # session-observability sinks (append+flush so everything survives
+        # a crash of any component): full-fidelity access log + WS frames
+        self.access_path = os.path.join(runs_dir, "access-%s.jsonl" % stamp)
+        self._access_file = open(self.access_path, "a", encoding="utf-8")
+        self.ws_log_path = os.path.join(runs_dir, "ws-%s.jsonl" % stamp)
+        self._ws_file = open(self.ws_log_path, "a", encoding="utf-8")
+        self._sink_lock = threading.Lock()
+        # /rig/live dashboard state: monotonic event ring + per-page verdicts
+        self.live_seq = 0
+        self.live_ring: deque[dict] = deque(maxlen=2000)
+        self.live_lock = threading.Lock()
+        self.console_first_seen: dict | None = None
+        self.last_page_reports: dict[str, dict] = {}
         with open(PORTAL_FILE, "r", encoding="utf-8") as f:
             html = f.read()
         self.portal_body = (html
@@ -534,8 +688,9 @@ class RigConfig:
         self.serving = "portal"
         self._page_lock = threading.Lock()
         self.fontchain_phase = max(1, min(MAX_PHASE, int(fontchain_phase)))
-        # wsagent control channel state (hub is attached by the server)
-        self.ws_hub = WsHub()
+        # wsagent control channel state (frame log + live ring wired in)
+        self.ws_hub = WsHub(frame_sink=self.append_ws_frame,
+                            on_event=self._ws_live_event)
 
     def _register_page(self, name: str, path: str | None) -> None:
         if not path or not os.path.isfile(path):
@@ -545,6 +700,73 @@ class RigConfig:
         self.pages[name] = (body
                             .replace("{{RIG_HOST}}", self.ip)
                             .replace("{{RIG_PORT}}", str(self.port))).encode("utf-8")
+
+    # ------------------------------------------------ observability sinks
+    def append_access(self, rec: dict) -> None:
+        """One JSON line per request (and per control-plane action) to the
+        run dir; append+flush so the log survives a crash."""
+        try:
+            line = json.dumps(rec, separators=(",", ":")) + "\n"
+            with self._sink_lock:
+                self._access_file.write(line)
+                self._access_file.flush()
+        except OSError:
+            pass                       # logging must never break serving
+
+    def append_ws_frame(self, rec: dict) -> None:
+        """One JSON line per WS frame, both directions."""
+        try:
+            line = json.dumps(rec, separators=(",", ":")) + "\n"
+            with self._sink_lock:
+                self._ws_file.write(line)
+                self._ws_file.flush()
+        except OSError:
+            pass
+
+    def live_emit(self, kind: str, peer: str = "-", summary: str = "",
+                  data=None) -> int:
+        """Append to the /rig/live ring with a monotonic seq."""
+        with self.live_lock:
+            self.live_seq += 1
+            seq = self.live_seq
+            self.live_ring.append({
+                "seq": seq,
+                "ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+                "kind": kind, "peer": peer, "summary": summary,
+                "data": data if data is not None else None})
+            return seq
+
+    def live_feed(self, since: int) -> dict:
+        with self.live_lock:
+            events = [dict(e) for e in self.live_ring if e["seq"] > since]
+            seq = self.live_seq
+            pages = {k: dict(v) for k, v in self.last_page_reports.items()}
+            console = dict(self.console_first_seen) if self.console_first_seen else None
+        return {"seq": seq, "events": events,
+                "status": self.live_status(pages, console)}
+
+    def live_status(self, pages: dict, console: dict | None) -> dict:
+        return {
+            "uptimeSec": int((datetime.now(timezone.utc) - self.started_at).total_seconds()),
+            "phase": self.get_phase(),
+            "serving": self.serving,
+            "wsAgent": bool(self.ws_hub.agent and self.ws_hub.agent.alive),
+            "wsAgentPeer": self.ws_hub.agent.peer if self.ws_hub.agent else None,
+            "console": console,
+            "pages": pages,
+            "rig": "%s/%s" % (RIG_NAME, RIG_VERSION),
+        }
+
+    def note_applet(self, peer: str) -> None:
+        """First WifiWebAuthApplet-UA telemetry: the entry-surface moment."""
+        if self.console_first_seen is None:
+            self.console_first_seen = {"peer": peer,
+                                       "ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds")}
+            self.live_emit("applet_entry", peer, "first applet telemetry")
+
+    def _ws_live_event(self, kind: str, peer: str, summary: str) -> None:
+        """WsHub -> live ring bridge (open/close/eval outcomes)."""
+        self.live_emit(kind, peer, summary)
 
     def portal_url(self) -> str:
         return "http://%s:%d/portal" % (self.ip, self.port)
@@ -597,6 +819,15 @@ class RigConfig:
     def close(self) -> None:
         with self._runs_lock:
             self._runs_file.close()
+        with self._sink_lock:
+            try:
+                self._access_file.close()
+            except OSError:
+                pass
+            try:
+                self._ws_file.close()
+            except OSError:
+                pass
 
 
 class RigHTTPServer(ThreadingHTTPServer):
@@ -670,11 +901,25 @@ class PortalHandler(BaseHTTPRequestHandler):
 
     def _log_access(self, status: int, size: int) -> None:
         uir = 1 if self.headers.get("Upgrade-Insecure-Requests") else 0
+        peer = self.client_address[0]
+        ua = self.headers.get("User-Agent") or ""
         LOG.info("%s %s %s %s -> %d %dB ua=%r host=%r uir=%d",
-                 self.client_address[0], self.command,
+                 peer, self.command,
                  self.headers.get("Host") or "-", self.path,
-                 status, size, self.headers.get("User-Agent") or "",
-                 self._host_header(), uir)
+                 status, size, ua, self._host_header(), uir)
+        # full-fidelity persistence: every request line lands in the run
+        # dir (append+flush). The /rig/live RING skips the dashboard's own
+        # feed polls -- infrastructure traffic is spinner noise, not signal
+        # (it stays fully recorded in access-*.jsonl).
+        self.cfg.append_access({
+            "ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+            "peer": peer, "method": self.command,
+            "host": self.headers.get("Host") or "-",
+            "path": self.path, "status": status, "bytes": size,
+            "ua": ua, "uir": uir})
+        if "/rig/live/feed" not in self.path:
+            self.cfg.live_emit("http_hit", peer,
+                               "%s %s %d %dB" % (self.command, self.path, status, size))
 
     # ---- HTTP verbs ------------------------------------------------------
 
@@ -780,6 +1025,24 @@ class PortalHandler(BaseHTTPRequestHandler):
             self._handle_phase(method)
         elif path == "/rig/png/ztxt":
             self._handle_png_craft(method, url)
+        elif path == "/rig/live":
+            if method != "GET":
+                raise RigHttpError(405, "E_METHOD", "GET /rig/live (dashboard)",
+                                   allow="GET")
+            self._send(200, LIVE_HTML.encode("utf-8"),
+                       "text/html; charset=utf-8", method)
+        elif path == "/rig/live/feed":
+            if method != "GET":
+                raise RigHttpError(405, "E_METHOD", "GET /rig/live/feed?since=N",
+                                   allow="GET")
+            since = 0
+            for pair in url.query.split("&"):
+                if pair.startswith("since="):
+                    try:
+                        since = int(pair[6:])
+                    except ValueError:
+                        raise RigHttpError(400, "E_BAD_SINCE", "since must be an int")
+            self._send_json(200, self.cfg.live_feed(since), method)
         elif path == "/rig/ws/send":
             self._handle_ws_send(method)
         elif path == "/rig/ws/state":
@@ -840,6 +1103,10 @@ class PortalHandler(BaseHTTPRequestHandler):
                                % (name, ", ".join(sorted(self.cfg.pages) or ["(none)"])))
         if self.cfg.swap_to(name):
             LOG.info("%s POST /rig/swap -> swapped /portal to %r", peer, name)
+            self.cfg.append_access({
+                "ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+                "kind": "swap", "peer": peer, "page": name})
+            self.cfg.live_emit("swap", peer, "/portal -> %s" % name)
             self._send_json(200, {"ok": True, "serving": name}, method)
         else:
             raise RigHttpError(409, "E_ALREADY_SERVING",
@@ -866,8 +1133,15 @@ class PortalHandler(BaseHTTPRequestHandler):
         if not isinstance(body, dict) or not isinstance(body.get("phase"), int):
             raise RigHttpError(400, "E_BAD_PHASE",
                                "body must be {\"phase\": <int 1..%d>}" % MAX_PHASE)
+        old_phase = self.cfg.get_phase()
         new_phase = self.cfg.set_phase(body["phase"])
         LOG.info("%s POST /rig/phase -> phase=%d", peer, new_phase)
+        self.cfg.append_access({
+            "ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+            "kind": "phase_gate", "peer": peer,
+            "from": old_phase, "to": new_phase})
+        self.cfg.live_emit("phase_gate", peer,
+                           "changed %d->%d" % (old_phase, new_phase))
         self._send_json(200, {"ok": True, "phase": new_phase}, method)
 
     def _handle_png_craft(self, method: str, url) -> None:
@@ -1013,6 +1287,23 @@ class PortalHandler(BaseHTTPRequestHandler):
             "data": data,
         }
         self.cfg.append_report(envelope)
+        # live/dashboard state: first applet UA = the entry-surface moment;
+        # every kit-page POST keeps its latest headline for the verdict panel
+        peer = self.client_address[0]
+        if "WifiWebAuthApplet" in envelope["ua"]:
+            self.cfg.note_applet(peer)
+        page = data.get("page")
+        if isinstance(page, str):
+            headline = data.get("verdict") or data.get("phase")
+            self.cfg.live_emit("page_report", peer,
+                               "%s phase=%s %s" % (page, data.get("phase"),
+                                                   headline or ""))
+            with self.cfg.live_lock:
+                self.cfg.last_page_reports[page] = {
+                    "ts": envelope["ts"], "phase": data.get("phase"),
+                    "verdict": data.get("verdict"),
+                    "effectivePhase": (data.get("gate") or {}).get("effectivePhase")
+                    if isinstance(data.get("gate"), dict) else None}
         self._send_json(200, {"ok": True, "bytes": length}, "POST")
 
     def _send_stage(self, path: str, method: str) -> None:
@@ -1391,6 +1682,87 @@ def self_test() -> int:
         check("/health -> 200", r.status == 200 and b"ready" in body)
         check("access log captured conntest hit",
               any("ctest.cdn.nintendo.net" in m and "-> 302" in m for m in sink.records))
+
+        # (g) /rig/live dashboard + feed: seq monotonicity, status shape,
+        # event filtering, page verdicts; plus on-disk persistence sinks
+        r, body = req(port, "GET", "/rig/live")
+        check("/rig/live -> 200 dashboard html",
+              r.status == 200 and b"/rig/live/feed" in body
+              and b"rig live" in body)
+        r, body = req(port, "GET", "/rig/live/feed?since=0")
+        feed1 = json.loads(body)
+        check("/rig/live/feed -> seq + events + status",
+              isinstance(feed1.get("seq"), int) and feed1["seq"] >= 1
+              and len(feed1["events"]) >= 1
+              and feed1["status"].get("phase") == 1
+              and "serving" in feed1["status"] and "wsAgent" in feed1["status"])
+        kinds1 = [e["kind"] for e in feed1["events"]]
+        check("feed carries http_hit events", "http_hit" in kinds1, "%r" % kinds1[:6])
+        seqs = [e["seq"] for e in feed1["events"]]
+        check("feed seq strictly monotonic", seqs == sorted(seqs)
+              and len(set(seqs)) == len(seqs))
+        # a new request must appear only after the cursor
+        r, _ = req(port, "GET", "/health")
+        r, body = req(port, "GET", "/rig/live/feed?since=%d" % feed1["seq"])
+        feed2 = json.loads(body)
+        check("feed since= filters correctly",
+              feed2["seq"] > feed1["seq"]
+              and all(e["seq"] > feed1["seq"] for e in feed2["events"])
+              and any(e["kind"] == "http_hit" for e in feed2["events"]))
+        # page_report: verdict panel + event
+        r, _ = req(port, "POST", "/report",
+                   body=json.dumps({"schema": 1, "page": "pngztxt",
+                                    "phase": "verdict",
+                                    "verdict": "PARSE-PATH-LIVE",
+                                    "gate": {"effectivePhase": 1}}).encode(),
+                   ctype="application/json")
+        r, body = req(port, "GET", "/rig/live/feed?since=%d" % feed2["seq"])
+        feed3 = json.loads(body)
+        check("page_report event + verdict panel",
+              any(e["kind"] == "page_report" and "pngztxt" in e["summary"]
+                  for e in feed3["events"])
+              and feed3["status"]["pages"].get("pngztxt", {}).get("verdict")
+              == "PARSE-PATH-LIVE")
+        # phase gate change lands as an event, then reset
+        r, _ = req(port, "POST", "/rig/phase", body=b'{"phase": 2}', ctype="application/json")
+        r, body = req(port, "GET", "/rig/live/feed?since=%d" % feed3["seq"])
+        feed4 = json.loads(body)
+        check("phase_gate event visible",
+              any(e["kind"] == "phase_gate" and "1->2" in e["summary"]
+                  for e in feed4["events"])
+              and feed4["status"]["phase"] == 2)
+        req(port, "POST", "/rig/phase", body=b'{"phase": 1}', ctype="application/json")
+        # applet first-seen: a WifiWebAuthApplet-UA report sets console state
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        conn.request("POST", "/report", body=b'{"schema":1}',
+                     headers={"Content-Type": "application/json",
+                              "User-Agent": "WifiWebAuthApplet/2.0 (LiveSim)"})
+        r = conn.getresponse()
+        r.read()
+        conn.close()
+        r, body = req(port, "GET", "/rig/live/feed?since=%d" % 0)
+        feedAll = json.loads(body)
+        check("applet_entry event + console first-seen in status",
+              any(e["kind"] == "applet_entry" for e in feedAll["events"])
+              and (feedAll["status"].get("console") or {}).get("peer") == "127.0.0.1")
+        # on-disk sinks survived everything this run threw at them
+        with open(cfg.access_path, "r", encoding="utf-8") as f:
+            alines = [json.loads(l) for l in f.read().splitlines() if l.strip()]
+        req_lines = [l for l in alines if "kind" not in l]
+        check("access jsonl persisted with request lines",
+              len(req_lines) >= 10 and all("peer" in l and "status" in l
+                                           for l in req_lines[:10]),
+              "req_lines=%d" % len(req_lines))
+        check("access jsonl carries control-plane lines",
+              any(l.get("kind") == "phase_gate" and l.get("from") == 1
+                  and l.get("to") == 2 for l in alines))
+        with open(cfg.ws_log_path, "r", encoding="utf-8") as f:
+            wlines = [json.loads(l) for l in f.read().splitlines() if l.strip()]
+        check("ws jsonl persisted both directions",
+              any(l.get("dir") == "in" for l in wlines)
+              and any(l.get("dir") == "out" for l in wlines)
+              and all("preview" in l and "size" in l for l in wlines[:4]),
+              "lines=%d" % len(wlines))
     finally:
         srv.shutdown()
         ok_srv.shutdown()

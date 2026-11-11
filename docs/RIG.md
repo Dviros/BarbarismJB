@@ -340,6 +340,46 @@ dumps), `p2b`, `p3`, `verdict` (e.g. `TRIGGER-LIVE-SURVIVED`,
 journals every kit-page POST as a `page_report` event with a per-page
 headline summary.
 
+### Session observability (full-fidelity logs, --verbose, /rig/live, session report)
+
+Everything a session produces is persisted to the runs dir with
+append+flush, so it survives a crash of any component:
+
+| file | content |
+|---|---|
+| `rig-<ts>.jsonl` | every `/report` body (full page telemetry envelopes) |
+| `access-<ts>.jsonl` | every portal request (`ts/peer/method/host/path/status/bytes/ua/uir`) plus control-plane lines (`kind: phase_gate` with from/to, `kind: swap`) |
+| `dns-queries.jsonl` | every DNS query dns.py handled (`ts/client/proto/qname/qtype/verdict/answer/rcode`) — dns.py `--log-jsonl`, wired by launch.py into the telemetry dir |
+| `ws-<ts>.jsonl` | every WebSocket frame both directions (`ts/dir/role/peer/opcode/size/preview` first 512B) |
+
+`launch.py --verbose` streams every journal event to the terminal as it
+lands — the launcher's TelemetryWatcher tails ALL the files above plus
+the portal's live ring, so the one-liners cover the whole session:
+`DNS_QUERY [console] ctest.p01... A 192.168.x.x`, `HTTP_HIT [console] GET
+/portal 302 0B UA=libcurl(nnNifm)`, `APPLET_ENTRY`, `PAGE_REPORT
+[capsweep] phase=full verdict=...`, `PHASE_GATE changed 1->2`,
+`WS_AGENT connected`, `WS_EVAL eval#12 ok 3ms`, `SWAP /portal->wsagent`.
+Compact, greppable, color when stdout is a tty; the dashboard's own feed
+polls are ring-filtered so there is no spinner noise. Default (non-
+verbose) keeps the classic quiet behavior.
+
+`/rig/live` (portal, GET, read-only, LAN-ok) is a self-contained
+dashboard: polls `/rig/live/feed?since=<seq>` once a second (monotonic
+seq over an in-memory ring of the last ~2000 events) and renders a
+status strip (uptime, phase gate, current `/portal` page, WS agent
+state, console first-seen), a live event table (auto-scroll toggle), and
+a verdict panel with the latest headline per kit page.
+
+At clean teardown (and on the SIGINT path) the launcher writes
+`<runs>/session-<ts>.md` — a markdown summary generated purely from the
+journal + persisted logs: session window, console first-seen, DNS stats
+(answered vs NXDOMAIN, unique qnames), HTTP stats by path+UA, applet
+entry yes/no, every kit page's final verdict and phase reached, WS eval
+stats, phase-gate history, anomalies (held ports, crashed kit pages,
+server errors, watcher errors), and a NEXT-STEPS checklist of gated
+phases attempted vs remaining. The path is linked from the teardown
+printout and recorded in `exit-summary.json`.
+
 ### Session journals (launch.py)
 
 Every `launch.py` session writes `tools/webkit-rig/runs/rig-sessions/<ts>/`:
@@ -350,6 +390,10 @@ Every `launch.py` session writes `tools/webkit-rig/runs/rig-sessions/<ts>/`:
 | `events.jsonl` | launcher events: preflight (incl. `preflight_hygiene`), pf anchor load/status, `applet_first_seen`, kit-page `page_report`, `services_stopped`, `ports_released`, teardown |
 | `portal.log` / `dns.log` | full service stdout/stderr (access logs included) |
 | `telemetry/rig-*.jsonl` | the runs file itself (the console's reports) |
+| `telemetry/access-*.jsonl` | every portal request + control-plane lines (see observability above) |
+| `telemetry/dns-queries.jsonl` | every DNS query dns.py handled |
+| `telemetry/ws-*.jsonl` | every WebSocket frame, both directions |
+| `telemetry/session-*.md` | the teardown session report |
 | `exit-summary.json` | per-console-IP first-seen state, telemetry line count, teardown results (incl. port-release verification) |
 
 ## Automation ladder — where launch.py takes us

@@ -44,8 +44,16 @@ verified; see `docs/PORTING.md` for the future Windows/Linux surfaces.
 python3 -m py_compile tools/webkit-rig/launch.py tools/webkit-rig/portal.py tools/webkit-rig/dns.py
 python3 tools/webkit-rig/launch.py --self-test     # expects: PASS (0 failures)
 python3 tools/webkit-rig/launch.py                 # router mode, interactive
+python3 tools/webkit-rig/launch.py --verbose       # + stream every event live
 python3 tools/webkit-rig/launch.py --mode list     # interfaces + Internet Sharing state
 ```
+
+While a session is up, watch it from any LAN machine (or this Mac):
+`http://<rig-ip>:8080/rig/live` — live dashboard (status strip, event
+table, kit verdicts), read-only, polls once a second. Everything is also
+persisted with full fidelity in the session's telemetry dir (access /
+dns-queries / ws jsonl + the rig runs file), and teardown writes a
+markdown `session-<ts>.md` summary with a NEXT-STEPS checklist.
 
 Serve a strike-kit page to the applet once the rig is up (deliberate,
 local-only; nothing swaps automatically anymore):

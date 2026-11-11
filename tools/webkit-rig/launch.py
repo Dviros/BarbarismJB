@@ -635,89 +635,238 @@ def build_service_cmds(ip: str, portal_port: int, dns_port: int,
                       "--ip", answer_ip or ip,   # barbarism: hijack-detection workaround — answer with a PUBLIC IP (router WAN) while still binding the LAN IP
                       "--bind", ip,
                       "--mode", dns_mode,
-                      "--port", str(dns_port)]
+                      "--port", str(dns_port),
+                      "--log-jsonl", os.path.join(runs_dir, "dns-queries.jsonl")]
     return (Service("portal", portal_cmd, portal_log),
             Service("dns", dns_cmd, dns_log))
 
 
 # ---------------------------------------------------------------------------
-# Telemetry watcher: applet banner + kit-page journaling + console state
+# Telemetry watcher: multi-file tailer + live-feed poller (observability)
 # ---------------------------------------------------------------------------
 
+def fmt_verbose(kind: str, payload: dict) -> str:
+    """One greppable line per event, no spinner noise. Pure: no newlines,
+    no color (colorize() adds ANSI separately when stdout is a tty)."""
+    p = payload or {}
+    peer = p.get("peer") or p.get("client") or ""
+    where = ("[%s] " % peer) if peer else ""
+    if kind == "dns_query":
+        line = "DNS_QUERY %s%s %s%s" % (
+            where, p.get("qname") or "?", p.get("verdict") or "?",
+            (" " + p["answer"]) if p.get("answer") else "")
+    elif kind == "http_hit":
+        line = "HTTP_HIT %s%s %s %s %sB UA=%s" % (
+            where, p.get("method") or "?", p.get("path") or "?",
+            p.get("status") or "?", p.get("bytes") if p.get("bytes") is not None else 0,
+            _ua_short(p.get("ua") or ""))
+    elif kind == "phase_gate":
+        line = "PHASE_GATE %schanged %s->%s" % (
+            where, p.get("from") if p.get("from") is not None else "?",
+            p.get("to") if p.get("to") is not None else "?")
+    elif kind == "swap":
+        line = "SWAP %s/portal->%s" % (where, p.get("page") or "?")
+    elif kind == "page_report":
+        line = "PAGE_REPORT [%s] phase=%s %s" % (
+            p.get("page") or "?", p.get("phase") or "?",
+            _verdict_of(p.get("summary")))
+    elif kind == "applet_first_seen" or kind == "applet_entry":
+        line = "APPLET_ENTRY %sfirst applet telemetry %s" % (
+            where, _ua_short(p.get("ua") or ""))
+    elif kind == "ws_agent":
+        line = "WS_AGENT %s%s" % (where, p.get("summary") or "state change")
+    elif kind == "ws_eval":
+        line = "WS_EVAL %seval#%s %s %sms" % (
+            where, p.get("id") or "?", "ok" if p.get("ok") else "ERR",
+            p.get("elapsed") if p.get("elapsed") is not None else "?")
+    elif kind == "ws_frame":
+        line = "WS_FRAME %s%s %s %sB" % (
+            where, p.get("dir") or "?", p.get("role") or "?",
+            p.get("size") if p.get("size") is not None else 0)
+    elif kind == "watcher_error":
+        line = "WATCHER_ERROR %s%s" % (where, p.get("error") or "?")
+    else:
+        extra = " ".join("%s=%s" % (k, v) for k, v in sorted(p.items())
+                         if isinstance(v, (str, int, float, bool)) and v is not None)
+        line = "%s %s%s" % (kind.upper(), where, extra)
+    return " ".join(line.split())          # collapse runs of spaces -> 1 line
+
+
+def _ua_short(ua: str) -> str:
+    """One compact token for the UA families that matter on the bench."""
+    if not ua:
+        return "-"
+    for marker, name in (("WifiWebAuthApplet", "applet"),
+                         ("libcurl", "libcurl"), ("Nintendo", "nintendo"),
+                         ("Mozilla", "mozilla")):
+        if marker in ua:
+            return name
+    return ua[:24]
+
+
+def _verdict_of(summary) -> str:
+    """Pull the headline verdict out of a kit-page summary dict."""
+    if isinstance(summary, dict):
+        for key in ("verdict", "p1", "loadOutcome", "note"):
+            if summary.get(key) is not None:
+                return "%s=%s" % (key, summary[key])
+        return ""
+    return str(summary or "")
+
+
+_VERBOSE_COLORS = {
+    "dns_query": "\033[36m", "http_hit": "\033[36m",
+    "applet_first_seen": "\033[32m", "applet_entry": "\033[32m",
+    "page_report": "\033[32m", "ws_agent": "\033[35m", "ws_eval": "\033[35m",
+    "phase_gate": "\033[33m", "swap": "\033[33m", "watcher_error": "\033[31m",
+}
+_RESET = "\033[0m"
+
+
+def colorize(line: str, kind: str) -> str:
+    c = _VERBOSE_COLORS.get(kind)
+    return "%s%s%s" % (c, line, _RESET) if c else line
+
+
 class TelemetryWatcher(threading.Thread):
-    """Tails the portal's runs jsonl; fires the applet banner on the first
-    WifiWebAuthApplet UA and journals every strike-kit page report as a
-    page_report event. (The old --auto-probe swap to probe-32439.html is
-    RETIRED -- CVE-2023-32439 is FTL-only and this console has no JIT;
-    see docs/NDAYS-V2.md. Kit pages are swapped deliberately by the
-    operator via /rig/swap?name=..., never automatically.)"""
+    """Session-observability core: tails EVERY jsonl the services persist
+    in the runs dir (rig-*.jsonl reports, access-*.jsonl requests +
+    control-plane lines, dns-queries.jsonl, ws-*.jsonl frames) and polls
+    the portal's /rig/live/feed ring for state the files don't carry
+    (applet_entry, ws agent connect/disconnect). Everything becomes a
+    journal event (so the session report has full fidelity) and, when the
+    journal is verbose, a formatted one-liner on the terminal.
+
+    Also keeps the classic behavior: applet banner on the first
+    WifiWebAuthApplet UA, per-kit-page page_report journaling."""
 
     POLL_S = 0.5
+    TAIL_PATTERNS = ("rig-*.jsonl", "access-*.jsonl", "dns-queries.jsonl",
+                     "ws-*.jsonl")
 
     def __init__(self, runs_dir: str, portal_ip: str, portal_port: int,
-                 on_event):
+                 on_event, verbose: bool = False):
         super().__init__(name="rig-telemetry-watcher", daemon=True)
         self.runs_dir = runs_dir
         self.portal_ip, self.portal_port = portal_ip, portal_port
         self.on_event = on_event          # callable(kind, **payload)
+        self.verbose = verbose
         self.stop_event = threading.Event()
         self.console_state: dict[str, dict] = {}
         self.banner_printed = False
         self.lines_seen = 0
-        self._fh = None
-        self._path = None
+        self._tails: dict[str, object] = {}      # path -> open file (from offset 0)
+        self._live_seq = 0
+        self._ws_pending: dict[str, dict] = {}   # eval id -> {code}
 
     def stop(self) -> None:
         self.stop_event.set()
 
-    def _discover(self) -> None:
-        files = sorted(glob.glob(os.path.join(self.runs_dir, "rig-*.jsonl")))
-        if not files:
-            return
-        self._path = files[-1]
-        # from offset 0: sessions get a fresh runs file at server start, and
-        # the self-test posts telemetry before the watcher thread starts
-        self._fh = open(self._path, "r", encoding="utf-8")
+    # ---- file tails ----------------------------------------------------
+    def _discover_and_read(self) -> None:
+        """Pick up new files each poll (services create them after we
+        start), then drain every tail; follow portal's roll-by-rename."""
+        for pattern in self.TAIL_PATTERNS:
+            for path in sorted(glob.glob(os.path.join(self.runs_dir, pattern))):
+                fh = self._tails.get(path)
+                if fh is None:
+                    # from offset 0: sessions get fresh files at start, and
+                    # the self-test posts telemetry before the watcher runs
+                    fh = open(path, "r", encoding="utf-8")
+                    self._tails[path] = fh
+                try:
+                    st = os.stat(path)
+                    pos = fh.tell()
+                    if st.st_ino != os.fstat(fh.fileno()).st_ino or st.st_size < pos:
+                        fh.close()
+                        fh = open(path, "r", encoding="utf-8")
+                        self._tails[path] = fh
+                except OSError:
+                    continue
+                for line in fh.readlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    self.lines_seen += 1
+                    try:
+                        self._dispatch_file_record(path, rec)
+                    except Exception as e:  # watcher must never die
+                        self.on_event("watcher_error", error=repr(e))
 
-    def _maybe_reopen(self) -> None:
-        """Follow portal.py's 64 MiB roll: it renames the file and reopens
-        the SAME path, so our fd follows the old inode. Detect via stat
-        (inode change or size shrunk below our offset) and reopen from 0 —
-        the post-roll file contains only new lines, so no duplicates."""
-        try:
-            st = os.stat(self._path)
-            pos = self._fh.tell()
-            if st.st_ino != os.fstat(self._fh.fileno()).st_ino or st.st_size < pos:
-                self._fh.close()
-                self._fh = open(self._path, "r", encoding="utf-8")
-        except OSError:
-            pass
-
-    def run(self) -> None:
-        while not self.stop_event.is_set():
+    def _dispatch_file_record(self, path: str, rec: dict) -> None:
+        name = os.path.basename(path)
+        if name.startswith("rig-"):
+            self.handle(rec)
+        elif name.startswith("access-"):
+            if rec.get("kind") == "phase_gate":
+                self.on_event("phase_gate", peer=rec.get("peer"),
+                              **{"from": rec.get("from"), "to": rec.get("to")})
+            elif rec.get("kind") == "swap":
+                self.on_event("swap", peer=rec.get("peer"),
+                              page=rec.get("page"))
+            else:
+                self.on_event("http_hit", peer=rec.get("peer"),
+                              method=rec.get("method"), path=rec.get("path"),
+                              status=rec.get("status"), bytes=rec.get("bytes"),
+                              ua=rec.get("ua"))
+        elif name == "dns-queries.jsonl":
+            self.on_event("dns_query", peer=rec.get("client"),
+                          client=rec.get("client"), proto=rec.get("proto"),
+                          qname=rec.get("qname"), qtype=rec.get("qtype"),
+                          verdict=rec.get("verdict"), answer=rec.get("answer"),
+                          rcode=rec.get("rcode"))
+        elif name.startswith("ws-"):
+            # frame log: correlate out {id,code} with in {id,ok,elapsed}
+            # into one ws_eval event; raw frames journal as ws_frame
+            self.on_event("ws_frame", peer=rec.get("peer"),
+                          dir=rec.get("dir"), role=rec.get("role"),
+                          size=rec.get("size"))
             try:
-                if self._fh is None:
-                    self._discover()
-                else:
-                    self._maybe_reopen()
-                if self._fh is not None:
-                    for line in self._fh.readlines():
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            env = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-                        self.lines_seen += 1
-                        try:
-                            self.handle(env)
-                        except Exception as e:  # watcher must never die
-                            self.on_event("watcher_error", error=repr(e))
-            except OSError:
+                if rec.get("dir") == "out" and rec.get("role") == "agent":
+                    msg = json.loads(rec.get("preview") or "{}")
+                    if isinstance(msg, dict) and msg.get("id") and "code" in msg:
+                        self._ws_pending[str(msg["id"])] = {"code": msg["code"]}
+                elif rec.get("dir") == "in" and rec.get("role") == "agent":
+                    msg = json.loads(rec.get("preview") or "{}")
+                    if isinstance(msg, dict) and msg.get("id") in self._ws_pending:
+                        self.on_event("ws_eval", peer=rec.get("peer"),
+                                      id=str(msg.get("id")),
+                                      ok=bool(msg.get("ok")),
+                                      elapsed=msg.get("elapsed"))
+                        self._ws_pending.pop(str(msg["id"]), None)
+            except (json.JSONDecodeError, ValueError):
                 pass
-            self.stop_event.wait(self.POLL_S)
 
+    # ---- portal live ring (state the files don't carry) ----------------
+    def _poll_live(self) -> None:
+        try:
+            resp, body = http_get(self.portal_ip, self.portal_port,
+                                  "/rig/live/feed?since=%d" % self._live_seq,
+                                  timeout=2.0)
+            if resp.status != 200:
+                return
+            feed = json.loads(body.decode("utf-8"))
+        except (OSError, ValueError):
+            return
+        self._live_seq = feed.get("seq", self._live_seq)
+        for ev in feed.get("events", []):
+            kind = ev.get("kind")
+            # swap/phase_gate/http_hit/page_report already arrive via the
+            # files with richer payloads -- only take the ring-only kinds
+            if kind in ("applet_entry", "ws_agent", "ws_console"):
+                # applet_entry dupes the report-side applet_first_seen
+                # (same moment, two sources); keep the ring event only if
+                # the report path has not already fired for this peer
+                if kind == "applet_entry" and ev.get("peer") in self.console_state:
+                    continue
+                self.on_event(kind, peer=ev.get("peer"),
+                              summary=ev.get("summary"))
+
+    # ---- report lines (rig-*.jsonl) ------------------------------------
     def handle(self, env: dict) -> None:
         peer = env.get("peer") or "?"
         ua = env.get("ua") or ""
@@ -740,6 +889,15 @@ class TelemetryWatcher(threading.Thread):
             print_kit_page(peer, page, data.get("phase"), summary)
             self.on_event("page_report", peer=peer, page=page,
                           phase=data.get("phase"), summary=summary)
+
+    def run(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                self._discover_and_read()
+                self._poll_live()
+            except OSError:
+                pass
+            self.stop_event.wait(self.POLL_S)
 
 
 def print_applet_banner(peer: str) -> None:
@@ -823,13 +981,16 @@ def print_kit_page(peer: str, page: str, phase, summary: dict) -> None:
 # ---------------------------------------------------------------------------
 
 class Journal:
-    def __init__(self, root: str = SESSIONS_ROOT, tag: str | None = None):
+    def __init__(self, root: str = SESSIONS_ROOT, tag: str | None = None,
+                 verbose: bool = False):
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         self.dir = os.path.join(root, (tag + "-") + stamp if tag else stamp)
         os.makedirs(self.dir, exist_ok=True)
         self.events_path = os.path.join(self.dir, "events.jsonl")
         self.telemetry_dir = os.path.join(self.dir, "telemetry")
         os.makedirs(self.telemetry_dir, exist_ok=True)
+        self.verbose = verbose
+        self._tty = sys.stdout.isatty()
         self._lock = threading.Lock()
 
     def write_config(self, cfg: dict) -> None:
@@ -842,6 +1003,11 @@ class Journal:
         with self._lock:
             with open(self.events_path, "a", encoding="utf-8") as f:
                 f.write(line + "\n")
+        if self.verbose:
+            out = fmt_verbose(kind, payload)
+            if self._tty:
+                out = colorize(out, kind)
+            print(out, flush=True)
 
     def write_exit_summary(self, payload: dict) -> None:
         with open(os.path.join(self.dir, "exit-summary.json"), "w",
@@ -1046,7 +1212,7 @@ Setup:
 # ---------------------------------------------------------------------------
 
 def run_session(args, mode: str, iface: dict, bind_ip: str) -> int:
-    journal = Journal()
+    journal = Journal(verbose=getattr(args, "verbose", False))
     for f in (PORTAL_PY, DNS_PY):
         if not os.path.isfile(f):
             raise LaunchError("E_MISSING_COMPONENT", "%s missing" % f)
@@ -1133,9 +1299,13 @@ def run_session(args, mode: str, iface: dict, bind_ip: str) -> int:
                   % (bind_ip, portal_port, bind_ip, dns_port))
 
         watcher = TelemetryWatcher(journal.telemetry_dir, bind_ip, portal_port,
-                                   journal.event)
+                                   journal.event,
+                                   verbose=getattr(args, "verbose", False))
         watcher.start()
         print("rig is up. Ctrl-C to stop (teardown: services, pf anchor, journal).")
+        if getattr(args, "verbose", False):
+            print("verbose: streaming every journal event (dashboard: "
+                  "http://%s:%d/rig/live)" % (bind_ip, portal_port))
         try:
             while True:
                 time.sleep(3600)
@@ -1152,6 +1322,180 @@ def run_session(args, mode: str, iface: dict, bind_ip: str) -> int:
           "          a portal, run portal.py --conntest-mode success once and\n"
           "          re-run the connection test (see README 'Cleanup').")
     return 0
+
+
+# ---------------------------------------------------------------------------
+# Teardown session report (markdown, from the journal + persisted logs)
+# ---------------------------------------------------------------------------
+
+def write_session_report(journal: Journal, results: dict,
+                         telemetry_dir: str) -> str:
+    """`<telemetry_dir>/session-<ts>.md` — everything the operator needs at
+    a glance, generated only from what was actually journaled/persisted."""
+    events = []
+    try:
+        with open(journal.events_path, "r", encoding="utf-8") as f:
+            events = [json.loads(l) for l in f.read().splitlines() if l.strip()]
+    except (OSError, json.JSONDecodeError):
+        pass
+    by_kind: dict[str, list[dict]] = {}
+    for e in events:
+        by_kind.setdefault(e.get("kind", "?"), []).append(e)
+
+    def first_of(kind):
+        return by_kind.get(kind, [None])[0]
+
+    dns_total = len(by_kind.get("dns_query", []))
+    dns_answered = sum(1 for e in by_kind.get("dns_query", [])
+                       if e.get("verdict") == "A")
+    dns_nx = sum(1 for e in by_kind.get("dns_query", [])
+                 if e.get("verdict") == "NXDOMAIN")
+    dns_names = sorted({e.get("qname") for e in by_kind.get("dns_query", [])
+                        if e.get("qname")})
+    http = by_kind.get("http_hit", [])
+    http_groups: dict[str, int] = {}
+    for e in http:
+        key = "%s %s UA=%s" % (e.get("method"), e.get("path"),
+                               _ua_short(e.get("ua") or ""))
+        http_groups[key] = http_groups.get(key, 0) + 1
+    applets = by_kind.get("applet_first_seen", []) + by_kind.get("applet_entry", [])
+    page_verdicts: dict[str, dict] = {}
+    page_phase: dict[str, int] = {}
+    for e in by_kind.get("page_report", []):
+        page = e.get("page")
+        if not page:
+            continue
+        page_verdicts[page] = e
+        summary = e.get("summary") or {}
+        if isinstance(summary, dict) and summary.get("effectivePhase") is not None:
+            page_phase[page] = summary["effectivePhase"]
+    gates = by_kind.get("phase_gate", [])
+    swaps = by_kind.get("swap", [])
+    ws_evals = by_kind.get("ws_eval", [])
+    ws_errors = sum(1 for e in ws_evals if not e.get("ok"))
+    anomalies = []
+    for e in by_kind.get("watcher_error", []):
+        anomalies.append("watcher error: %s" % e.get("error"))
+    held = [p for p, s in (results.get("teardown", {}).get("ports") or {}).items()
+            if str(s).startswith("HELD")]
+    if held:
+        anomalies.append("ports still held after teardown: %s" % ", ".join(held))
+    crashed = [e for e in by_kind.get("page_report", [])
+               if e.get("phase") == "crash"]
+    for e in crashed:
+        anomalies.append("kit page %s posted a crash phase" % e.get("page"))
+    status_5xx = [e for e in http if (e.get("status") or 0) >= 500]
+    if status_5xx:
+        anomalies.append("%d server-error responses" % len(status_5xx))
+
+    # NEXT-STEPS: which gated phases were reached vs what remains
+    max_gate = max([g.get("to") for g in gates if g.get("to") is not None]
+                   + [1])
+    remaining = []
+    if max_gate < 3:
+        remaining.append("phase gate at %d: fontchain/pngztxt/freeze phases "
+                         "%d-3 unattempted" % (max_gate, max_gate + 1))
+    for page, phase in sorted(page_phase.items()):
+        if page == "webp4863" and phase is not None and phase < 2:
+            remaining.append("webp4863 one-shot not armed (needs gate 2 + "
+                             "staged asset)")
+    if not ws_evals:
+        remaining.append("wsagent eval channel unused this session")
+    if not applets:
+        remaining.append("no applet telemetry this session (entry surface "
+                         "not exercised)")
+
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    path = os.path.join(telemetry_dir, "session-%s.md" % ts)
+    lines = []
+    a = lines.append
+    a("# webkit-rig session report — %s" % ts)
+    a("")
+    a("- session window: %s .. %s" % (
+        (first_of("session_start") or {}).get("ts", "?"),
+        results.get("endedUtc", utcnow())))
+    cfg_mode = (first_of("session_start") or {})
+    a("- mode: %s | bind: %s | ports: %s" % (
+        cfg_mode.get("mode", "?"), cfg_mode.get("ip", "?"),
+        cfg_mode.get("ports", "?")))
+    if applets:
+        first = applets[0]
+        a("- console: %s (first applet telemetry %s)" % (
+            first.get("peer", "?"), first.get("ts", "?")))
+    else:
+        a("- console: NO applet telemetry this session")
+    a("")
+    a("## DNS")
+    a("- %d queries: %d answered, %d NXDOMAIN, %d other" % (
+        dns_total, dns_answered, dns_nx,
+        dns_total - dns_answered - dns_nx))
+    if dns_names:
+        a("- unique qnames (%d): %s" % (len(dns_names),
+                                        ", ".join(dns_names[:12]) +
+                                        (" …" if len(dns_names) > 12 else "")))
+    a("")
+    a("## HTTP")
+    if http_groups:
+        for key in sorted(http_groups, key=lambda k: -http_groups[k])[:15]:
+            a("- %4d  %s" % (http_groups[key], key))
+    else:
+        a("- no requests journaled")
+    a("")
+    a("## Applet entry")
+    a("- %s" % ("YES — captive-portal flow worked end to end"
+                if applets else "no"))
+    for e in applets[:3]:
+        a("  - %s %s" % (e.get("ts"), e.get("peer")))
+    a("")
+    a("## Kit pages")
+    if page_verdicts:
+        for page in sorted(page_verdicts):
+            e = page_verdicts[page]
+            summary = e.get("summary") or {}
+            verdict = (summary.get("verdict") if isinstance(summary, dict)
+                       else None) or e.get("phase")
+            a("- **%s**: phase %s, reached gate-phase %s, last report %s"
+              % (page, e.get("phase"), page_phase.get(page, "?"),
+                 verdict or "?"))
+    else:
+        a("- no kit-page reports this session")
+    a("")
+    a("## WebSocket channel")
+    a("- %d evals (%d errors); %d agent state events" % (
+        len(ws_evals), ws_errors, len(by_kind.get("ws_agent", []))))
+    a("")
+    a("## Phase-gate history")
+    if gates:
+        for e in gates:
+            a("- %s %s->%s (by %s)" % (e.get("ts"), e.get("from"),
+                                        e.get("to"), e.get("peer")))
+    else:
+        a("- unchanged (1)")
+    if swaps:
+        a("")
+        a("## Page swaps")
+        for e in swaps:
+            a("- %s /portal -> %s" % (e.get("ts"), e.get("page")))
+    a("")
+    a("## Anomalies")
+    if anomalies:
+        for x in anomalies:
+            a("- %s" % x)
+    else:
+        a("- none")
+    a("")
+    a("## NEXT STEPS")
+    if remaining:
+        for x in remaining:
+            a("- [ ] %s" % x)
+    else:
+        a("- nothing gated left unattempted")
+    a("")
+    a("*Generated from events.jsonl + the persisted access/dns/ws logs in "
+      "this directory; full fidelity lives there.*")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    return path
 
 
 def teardown(journal: Journal, portal_svc: Service, dns_svc: Service,
@@ -1176,6 +1520,15 @@ def teardown(journal: Journal, portal_svc: Service, dns_svc: Service,
         results["teardown"]["ports"] = wait_ports_released(ports)
         journal.event("ports_released", **{str(p): s for p, s in
                                            results["teardown"]["ports"].items()})
+    # markdown session report from the journal + persisted logs
+    try:
+        report_path = write_session_report(journal, results,
+                                           journal.telemetry_dir)
+        results["session_report"] = report_path
+        journal.event("session_report", path=report_path)
+        print("session report: %s" % report_path)
+    except OSError as e:
+        print("warning: session report not written (%s)" % e)
     print("teardown: portal=%s dns=%s pf-anchor=%s ports=%s"
           % (results["teardown"]["portal_stopped"],
              results["teardown"]["dns_stopped"],
@@ -1402,6 +1755,90 @@ def self_test() -> int:
               and kit_events[0]["summary"]["note"] == "connect #1",
               "events=%r" % kit_events)
 
+        # (d4) observability: verbose formatter shape (pure, one line each)
+        sample = fmt_verbose("dns_query", {"client": "192.168.1.7",
+                                           "qname": "ctest.p01.ctest.srv.nintendo.net",
+                                           "verdict": "A", "answer": "192.168.1.5"})
+        check("(d4) fmt_verbose dns_query one-liner",
+              sample == "DNS_QUERY [192.168.1.7] ctest.p01.ctest.srv.nintendo.net A 192.168.1.5"
+              and "\n" not in sample, "got %r" % sample)
+        sample = fmt_verbose("http_hit", {"peer": "192.168.1.7", "method": "GET",
+                                          "path": "/portal", "status": 302,
+                                          "bytes": 0, "ua": "libcurl(nnNifm)"})
+        check("(d4) fmt_verbose http_hit one-liner",
+              sample.startswith("HTTP_HIT [192.168.1.7] GET /portal 302 0B UA=libcurl")
+              and "\n" not in sample, "got %r" % sample)
+        sample = fmt_verbose("phase_gate", {"peer": "127.0.0.1", "from": 1, "to": 2})
+        check("(d4) fmt_verbose phase_gate one-liner",
+              sample == "PHASE_GATE [127.0.0.1] changed 1->2", "got %r" % sample)
+        sample = fmt_verbose("page_report", {"page": "pngztxt", "phase": "verdict",
+                                             "summary": {"verdict": "PARSE-PATH-LIVE"}})
+        check("(d4) fmt_verbose page_report one-liner",
+              sample == "PAGE_REPORT [pngztxt] phase=verdict verdict=PARSE-PATH-LIVE",
+              "got %r" % sample)
+
+        # (d5) observability: the watcher tails ALL persisted files and
+        # journals them (access comes from this test's own traffic; dns and
+        # ws lines are synthesized into the same files the services use)
+        with open(os.path.join(journal.telemetry_dir, "dns-queries.jsonl"),
+                  "a", encoding="utf-8") as f:
+            f.write(json.dumps({"ts": utcnow(), "client": "127.0.0.1",
+                                "proto": "udp", "qname": "ctest.cdn.nintendo.net",
+                                "qtype": 1, "verdict": "A",
+                                "answer": "127.0.0.1", "rcode": 0}) + "\n")
+        ws_log = glob.glob(os.path.join(journal.telemetry_dir, "ws-*.jsonl"))
+        if ws_log:
+            with open(ws_log[0], "a", encoding="utf-8") as f:
+                f.write(json.dumps({"ts": utcnow(), "dir": "out",
+                                    "role": "agent", "peer": "127.0.0.1",
+                                    "opcode": 1, "size": 24,
+                                    "preview": '{"id":"t9","code":"1+1"}'}) + "\n")
+                f.write(json.dumps({"ts": utcnow(), "dir": "in",
+                                    "role": "agent", "peer": "127.0.0.1",
+                                    "opcode": 1, "size": 40,
+                                    "preview": '{"id":"t9","ok":true,"result":2,"elapsed":0.4}'}) + "\n")
+        resp, body = http_post("127.0.0.1", port, "/rig/phase",
+                               json.dumps({"phase": 2}).encode())
+        deadline = time.monotonic() + 8
+        need = {"dns_query": False, "http_hit": False, "ws_frame": False,
+                "ws_eval": False, "phase_gate": False}
+        while time.monotonic() < deadline and not all(need.values()):
+            for e in events:
+                if e["kind"] in need:
+                    need[e["kind"]] = True
+            time.sleep(0.2)
+        check("(d5) dns_query event tailed+journaled", need["dns_query"],
+              "need=%r" % need)
+        check("(d5) http_hit event tailed+journaled", need["http_hit"])
+        check("(d5) ws_frame event tailed+journaled", need["ws_frame"])
+        check("(d5) ws frames correlated into ws_eval", need["ws_eval"])
+        check("(d5) phase_gate event tailed+journaled", need["phase_gate"])
+        ws_eval_ev = [e for e in events if e["kind"] == "ws_eval"]
+        check("(d5) ws_eval carries id/ok/elapsed",
+              ws_eval_ev and ws_eval_ev[-1].get("id") == "t9"
+              and ws_eval_ev[-1].get("ok") is True
+              and ws_eval_ev[-1].get("elapsed") == 0.4,
+              "ev=%r" % ws_eval_ev[-1:])
+        http_post("127.0.0.1", port, "/rig/phase", json.dumps({"phase": 1}).encode())
+
+        # (d6) session report from the (synthetic) journal this test built
+        report = write_session_report(journal, {"endedUtc": utcnow(),
+                                                "teardown": {}},
+                                      journal.telemetry_dir)
+        check("(d6) session report written", os.path.isfile(report))
+        text = open(report, "r", encoding="utf-8").read()
+        check("(d6) report has session + DNS + HTTP + kit sections",
+              all(s in text for s in ("# webkit-rig session report",
+                                      "## DNS", "## HTTP", "## Kit pages",
+                                      "## Phase-gate history", "## NEXT STEPS")),
+              "sections missing")
+        check("(d6) report carries the synthetic dns query",
+              "ctest.cdn.nintendo.net" in text and "1 answered" in text)
+        check("(d6) report carries the kit verdict",
+              "wsagent" in text)
+        check("(d6) report carries gate history",
+              "1->2" in text)
+
         # (f) rig hygiene: stale-rig listener reaping + foreign safety +
         # release verification, all against a REAL spawned portal.py
         if sys.platform == "darwin":
@@ -1562,6 +1999,12 @@ def main(argv=None) -> int:
                          "auto: pf anchor -> direct -> high port; anchor: pf "
                          "only, degrade to high port; highport: no privileged "
                          "anything")
+    ap.add_argument("--verbose", action="store_true",
+                    help="stream EVERY journal event to the terminal as it "
+                         "lands (DNS_QUERY / HTTP_HIT / PAGE_REPORT / "
+                         "PHASE_GATE / SWAP / WS_AGENT / WS_EVAL one-liners, "
+                         "color when stdout is a tty). Default: quiet except "
+                         "banners and kit verdicts")
     ap.add_argument("--self-test", action="store_true",
                     help="loopback-only offline self-test (no console, no pf, no sudo)")
     args = ap.parse_args(argv)
