@@ -104,9 +104,10 @@ fi
 rm -f "$ROOT/runs/test-nso-smoke.nso"
 
 # 5) webkit-rig launcher self-test (loopback-only: portal+dns on high ports,
-# conntest 302, applet-telemetry auto-probe swap, 32439 probe page + its
-# node --check, journal, teardown; no console, no pf, no sudo).
-if run_step 60 python3 tools/webkit-rig/launch.py --self-test; then record "webkit-rig launcher self-test" 0; else record "webkit-rig launcher self-test" 1; fi
+# conntest 302, applet banner + kit-page journaling, kit pages + their
+# node --check, parked-page exclusion, stale-listener hygiene, journal,
+# teardown port-verification; no console, no pf, no sudo).
+if run_step 90 python3 tools/webkit-rig/launch.py --self-test; then record "webkit-rig launcher self-test" 0; else record "webkit-rig launcher self-test" 1; fi
 
 echo
 echo "────────────────────────────────────────────"

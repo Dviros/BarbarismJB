@@ -75,14 +75,21 @@ fields:
 Server-side access logs (both scripts) add the request-side view: every
 GET/POST with Host, UA, status, and the `Upgrade-Insecure-Requests` flag.
 
-### Schema 1b — the 32439 probe report (probe-32439.html)
+### Schema 1b — the 32439 probe report (probe-32439.html) — RETIRED from the auto-chain
 
-With `launch.py --auto-probe`, after the first WifiWebAuthApplet telemetry
-line the launcher swaps `/portal` to `probe-32439.html` (via portal.py's
-local-only `POST /rig/swap`). That page POSTs the same envelope shape with
-`data.probe = "cve-2023-32439"` and two phases (`env` before the stages,
-`verdict` at the end; a driver-level crash leaves a `crash` phase with
-`data.stage = "CRASHED@…"`):
+The `launch.py --auto-probe` chain (auto-swap to `probe-32439.html` after
+the first applet telemetry) is RETIRED (2026-11-11): CVE-2023-32439 is an
+FTL miscompile, this console's engine has NO JIT (docs/NDAYS-V2.md
+verified exclusions), so the detector can never fire for the right
+reason. The page survives for one deliberate use — its stage-A tiering
+probe as an INVERTED falsifier: serve it manually
+(`portal.py --probe-page probe-32439.html`, then local-only
+`POST /rig/swap`); if stage A ever reports `jit_tiering_likely`, the
+no-JIT engine model is wrong. Stage-B variant verdicts are dead weight on
+this build and should be ignored. When manually served, it POSTs the same
+envelope shape with `data.probe = "cve-2023-32439"` and two phases
+(`env` before the stages, `verdict` at the end; a driver-level crash
+leaves a `crash` phase with `data.stage = "CRASHED@…"`):
 
 | field | content |
 |---|---|
@@ -104,10 +111,10 @@ copied PoC (we have none) — see its header comment and
 variant errored before comparison); it is NOT clean — re-run with the
 applet open longer before drawing conclusions.
 
-### Applet strike kit (pages/ — capsweep, wsagent, fontchain, varargs, strnorm)
+### Applet strike kit (pages/ — capsweep, wsagent, fontchain; pages/parked/ is dead)
 
-`tools/webkit-rig/pages/` holds the strike kit: every `*.html` in it is
-auto-registered by filename stem at portal.py startup (same
+`tools/webkit-rig/pages/` holds the strike kit: every top-level `*.html`
+in it is auto-registered by filename stem at portal.py startup (same
 `{{RIG_HOST}}/{{RIG_PORT}}` templating as the other pages). Each page is
 served directly at `/page/<name>` and can be force-swapped onto `/portal`
 (the URL the applet follows) with a local-only control POST:
@@ -116,10 +123,33 @@ served directly at `/page/<name>` and can be force-swapped onto `/portal`
 # serve one to the applet (from the bench host only)
 curl -X POST 'http://127.0.0.1:8080/rig/swap?name=fontchain'
 curl -X POST 'http://127.0.0.1:8080/rig/swap?name=capsweep'   # or wsagent
-# no-arg POST stays back-compat: swap to the --probe-page (32439)
+# no-arg POST stays back-compat: swap to the --probe-page (32439 falsifier)
 # direct test load (any LAN peer, no swap needed)
 curl http://<rig-ip>:8080/page/wsagent
 ```
+
+**PARKED-DEAD — `pages/parked/varargs.html` and
+`pages/parked/strnorm.html`.** Both oracle pages are RETIRED FROM SERVICE
+(2026-11-11 reachability re-check, docs/NDAYS-V2.md §1 + §4) and moved
+under `pages/parked/`: parked pages are never auto-registered (only
+top-level `pages/*.html` register), never servable at `/page/…`, and
+never swappable — the self-test asserts exactly that.
+
+- **varargs.html (CVE-2023-43000)**: DEAD CODE PATH — the vulnerable
+  `MarkedVector::fill` at `LLIntSlowPaths.cpp:2318` is dispatched ONLY by
+  `llint_slow_path_checkpoint_osr_exit` → `popCheckpointOSRSideState`,
+  whose sole creator is `dfg/DFGOSRExit.cpp:239`; DFG is compiled out on
+  this no-JIT build, so nothing ever pushes the side state and the buggy
+  fill can never run for the right reason (plain `f(...x)` uses the
+  stack-based `varargsSetup`).
+- **strnorm.html (CVE-2025-43429)**: GUARDED — the rdar://160634825 fix
+  WAS backported: `StringPrototype.cpp:1935-1939` throws OOM for
+  `length >= (1 << 30)` directly above the normalize call site; the
+  case-convert path is unguarded but infeasible (>2 GiB strings vs the
+  ~341 MiB applet heap).
+
+The full design/write-ups stay in the parked files' headers for
+archaeology; the pages parse (node --check) if ever revived.
 
 **capsweep.html — one-shot capability census.** Auto-runs on load: typeof
 matrix over the confirmed/dead API lists + fork markers, syntax probes,
@@ -184,7 +214,7 @@ byte-for-byte verification after each pressured apply. Telemetry phases
 `env`/`progress`/`verdict`/`crash` with `p1.shapes[]`, `p2.rounds[]`,
 `p3.runs[]`; verdicts `BASELINE-CONSISTENT`, `DIVERGENCE`,
 `PRESSURE-SIGNAL`, `PRESSURE-CLEAN`, `VICTIM-CORRUPTION`,
-`PRIOR-RUN-CRASHED`.
+`PRIOR-RUN-CRASHED`. **PARKED — see the block above.**
 
 **strnorm.html — JSC→ICU int32 length-overflow oracle (CVE-2025-43429
 class), phased.** Verified in our tree:
@@ -212,6 +242,7 @@ after phase 2 maps the boundary on-device). Every run reports
 memoryBefore/After}`; verdicts `ARITHMETIC-CLEAN`,
 `LADDER-COMPLETE/CLEAN/DIVERGENCE@N`, `ABORTED-BUDGET-AT-N`,
 `BUDGET-TOO-SMALL`, `LADDER-TIME-CUT`, `PRIOR-RUN-CRASHED`.
+**PARKED — see the block above.**
 
 **fontchain.html — CSSFontFace::setStatus UAF harness (CVE-2026-43715
 class), PHASED and SAFE by default.** Built from the publicly documented
@@ -254,10 +285,10 @@ Every `launch.py` session writes `tools/webkit-rig/runs/rig-sessions/<ts>/`:
 | file | content |
 |---|---|
 | `config.json` | mode, chosen interface/IP, bind result, ports, pf state, sharing state, platform, argv |
-| `events.jsonl` | launcher events: preflight results, pf anchor load/status, `applet_first_seen`, `probe_swap`, `probe_served`, `probe_verdict`, teardown |
+| `events.jsonl` | launcher events: preflight (incl. `preflight_hygiene`), pf anchor load/status, `applet_first_seen`, kit-page `page_report`, `services_stopped`, `ports_released`, teardown |
 | `portal.log` / `dns.log` | full service stdout/stderr (access logs included) |
 | `telemetry/rig-*.jsonl` | the runs file itself (the console's reports) |
-| `exit-summary.json` | per-console-IP state (`first_seen`, `probe_served`, `probe_verdict`), telemetry line count, teardown results |
+| `exit-summary.json` | per-console-IP first-seen state, telemetry line count, teardown results (incl. port-release verification) |
 
 ## Automation ladder — where launch.py takes us
 
@@ -266,8 +297,10 @@ AUTOMATED per session:
 
 1. **Preflight** — macOS check; IPv4 interface enumeration
    (`networksetup -listallhardwareports` + `ifconfig` parsing) with
-   interactive pick and `--interface`/`--ip` overrides; high-port
-   bindability checks; Internet Sharing state (read-only `defaults read
+   interactive pick and `--interface`/`--ip` overrides; STALE-RIG-LISTENER
+   HYGIENE (lsof pid map + ps full-command match reaps our leftovers on
+   80/443/53/8080/5353, never foreign listeners); high-port bindability
+   checks; Internet Sharing state (read-only `defaults read
    …/com.apple.nat`); pf state reported (checked for real, read-only,
    during bring-up).
 2. **pf anchor** — services run UNPRIVILEGED on 8080/5353; the
@@ -275,9 +308,12 @@ AUTOMATED per session:
    redirects 80→8080 and 53→5353; load, verify, and teardown touch ONLY
    that anchor.
 3. **Services** — portal.py + dns.py supervised (logs into the journal,
-   health-checked, SIGTERM-safe teardown, orphan-free).
-4. **Auto-probe swap** — telemetry tailed live; first applet UA → banner;
-   `--auto-probe` swaps `/portal` to the 32439 detector automatically.
+   health-checked, SIGTERM-safe teardown, orphan-free); teardown VERIFIES
+   the session's ports released (retry loop, warn + journal on holds).
+4. **Telemetry hooks** — runs jsonl tailed live; first applet UA → banner;
+   every kit-page POST journals a `page_report` event. Page selection is
+   the operator's explicit `/rig/swap?name=…` (the `--auto-probe` chain is
+   retired — the 32439 detector was FTL-only on a no-JIT console).
 5. **Journaling** — everything above lands in `runs/rig-sessions/<ts>/`.
 
 What remains MANUAL (by design — they live on the console or in system

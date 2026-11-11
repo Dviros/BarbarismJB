@@ -71,13 +71,16 @@ post-fork regressions (32373, 42950), info-only (30425).
 
 ## 3. Kit integration
 
-- `varargs.html` (43000 oracle) and `strnorm.html` (43429 oracle) — being
-  added to the strike kit, same phase-gate conventions as `fontchain.html`.
+- `varargs.html` (43000 oracle) and `strnorm.html` (43429 oracle) — built,
+  browser-verified, then **PARKED to `pages/parked/`** per §1/§4 (never
+  auto-registered; PARKED-DEAD banners carry the full reasons). The live
+  kit is capsweep / wsagent / fontchain.
 - capsweep's AudioContext + gamepad probes resolve candidate #5's gate.
-- The 43000 victim-shaping phase (if the oracle fires) targets typed-array
-  backing stores in the marshalled-args buffer → the **JSC-object-level
-  primitive** the CSSFontFace chain never reached (its 16 MB window is
-  engine-external; 43000 corrupts inside the JSC heap directly).
+- The 43000 victim-shaping design (had the oracle fired) targeted
+  typed-array backing stores in the marshalled-args buffer → the
+  **JSC-object-level primitive** the CSSFontFace chain never reached; it
+  stays documented in the parked page for if a reachable variant of the
+  bug class ever reopens.
 
 ## Sources
 

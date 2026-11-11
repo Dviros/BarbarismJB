@@ -3,10 +3,10 @@
 Local test rig that puts our own JavaScript into the Switch 2's
 WifiWebAuthApplet over the captive-portal vector, on stock firmware
 23.0.1, with zero exploits. It proves the entry surface, collects
-telemetry, and — via `launch.py --auto-probe` — runs the CVE-2023-32439
-behavioral miscompile detector. Nothing here is a code-execution payload
-(that is a separate workstream — see `docs/RIG.md` and
-`docs/WEBKIT-EXPLOIT-RESEARCH.md`).
+telemetry, and serves the applet strike kit (capability census, WS eval
+agent, phased exploit-oracle harnesses) via deliberate per-page swaps.
+Nothing here is a code-execution payload (that is a separate workstream —
+see `docs/RIG.md` and `docs/WEBKIT-EXPLOIT-RESEARCH.md`).
 
 Mechanism in one paragraph (`docs/WEBKIT-ENTRY.md` §1, §5): the console's
 connectivity test polls plain-HTTP hosts (`ctest.cdn.nintendo.net`,
@@ -25,11 +25,13 @@ WAN.**
 
 | file | role |
 |---|---|
-| `launch.py` | one-command macOS orchestrator: preflight, pf anchor, services, auto-probe swap, session journal |
+| `launch.py` | one-command macOS orchestrator: preflight (incl. stale-rig-listener hygiene), pf anchor, services, telemetry watcher, session journal |
 | `dns.py` | authoritative LAN DNS (UDP+TCP): answers the conntest hosts with our IP, NXDOMAINs the rest (or catch-all) |
-| `portal.py` | HTTP server: conntest → 302 without `X-Organization`; `/portal` probe page; `/report` telemetry sink; `/stage/*` payload staging; local-only `/rig/swap` |
+| `portal.py` | HTTP server: conntest → 302 without `X-Organization`; `/portal` current page; `/page/<name>` direct serving; `/report` telemetry sink; `/stage/*` payload staging; `/ws` WebSocket bridge; local-only `/rig/swap[?name=]`, `/rig/phase`, `/rig/ws/send`, `/rig/ws/state` |
 | `portal.html` | the schema-1 page that runs inside the applet (environment/features/JIT/WS telemetry) |
-| `probe-32439.html` | the CVE-2023-32439 behavioral miscompile detector (auto-chain stage 2) |
+| `pages/` | applet strike kit, auto-registered by filename stem: `capsweep.html` (capability census), `wsagent.html` (WS eval-RPC agent), `fontchain.html` (phased CSSFontFace UAF harness) |
+| `pages/parked/` | PARKED-DEAD oracle pages kept for archaeology (`varargs.html`, `strnorm.html`) — never registered, never swappable; see docs/NDAYS-V2.md §1/§4 |
+| `probe-32439.html` | RETIRED from the auto-chain (CVE-2023-32439 is FTL-only, this console has no JIT). Kept as a manual inverted no-JIT falsifier: serve with `--probe-page probe-32439.html` + `/rig/swap`; a `jit_tiering_likely` stage-A verdict would falsify the no-JIT model — its stage-B variant verdicts are meaningless here |
 | `runs/` | telemetry output + `rig-sessions/` journals — created at runtime |
 | `stage/` | drop files here to serve them at `/stage/<name>` — created at runtime |
 
@@ -42,16 +44,25 @@ verified; see `docs/PORTING.md` for the future Windows/Linux surfaces.
 python3 -m py_compile tools/webkit-rig/launch.py tools/webkit-rig/portal.py tools/webkit-rig/dns.py
 python3 tools/webkit-rig/launch.py --self-test     # expects: PASS (0 failures)
 python3 tools/webkit-rig/launch.py                 # router mode, interactive
-python3 tools/webkit-rig/launch.py --auto-probe    # + 32439 detector after first applet hit
 python3 tools/webkit-rig/launch.py --mode list     # interfaces + Internet Sharing state
+```
+
+Serve a strike-kit page to the applet once the rig is up (deliberate,
+local-only; nothing swaps automatically anymore):
+
+```sh
+curl -X POST 'http://127.0.0.1:8080/rig/swap?name=capsweep'    # next /portal load runs it
+curl -X POST 'http://127.0.0.1:8080/rig/swap?name=portal'      # back to the schema-1 page
 ```
 
 `launch.py --mode router` (the default):
 
 1. **Preflight** — enumerates IPv4 interfaces (`networksetup` + `ifconfig`),
    picks the LAN interface (interactively if several; `--interface en0` /
-   `--ip` to pin), checks the high ports, reads Internet Sharing state
-   (read-only) and warns about pf.
+   `--ip` to pin), REAPS stale webkit-rig listeners from prior sessions on
+   80/443/53/8080/5353 (only processes whose command line is ours — foreign
+   listeners are reported and never touched), checks the high ports, reads
+   Internet Sharing state (read-only) and warns about pf.
 2. **Privileges, done right** — portal.py and dns.py run UNPRIVILEGED on
    8080/5353; a minimal pf anchor `com.barbarismjb.rig` (table-less rdr on
    the chosen interface only) redirects tcp 80→8080 and udp+tcp 53→5353.
@@ -69,15 +80,19 @@ python3 tools/webkit-rig/launch.py --mode list     # interfaces + Internet Shari
 3. **Console steps** — printed with the detected IP, including the
    DO-NOT-UPDATE warning (keep the console on 23.0.1; never
    test-update while rigged).
-4. **Auto-chain** — telemetry is tailed live; the first WifiWebAuthApplet
-   UA prints a banner, and with `--auto-probe` the next `/portal` serves
-   swap to `probe-32439.html` automatically. Verdicts print and land in
-   the journal.
+4. **Telemetry hooks** — the runs file is tailed live; the first
+   WifiWebAuthApplet UA prints a banner, and every strike-kit page report
+   (`data.page` marker) journals a `page_report` event with a headline.
+   Which page the applet gets is the operator's explicit `/rig/swap` —
+   nothing auto-swaps (the old `--auto-probe` chain is retired; the
+   32439 detector was FTL-only and this console has no JIT).
 5. **Session journal** — `runs/rig-sessions/<ts>/`: `config.json`,
    `events.jsonl`, `portal.log`, `dns.log`, `telemetry/` (the runs file
    itself), `exit-summary.json`. Everything needed to file a bug on
    ourselves.
 6. **Ctrl-C (or SIGTERM)** tears down: services stopped, anchor flushed,
+   port release VERIFIED (retry loop warns and journals if something
+   still holds 80/443/53 — the next session's hygiene pass will reap it),
    summary written, console-cleanup steps printed.
 
 `launch.py --mode standalone` (EXPERIMENTAL): guides through System
@@ -96,8 +111,8 @@ launcher.
    the portal applet opens on our probe page. Press **+ (Information)** to
    confirm the loaded URL (`http://<bench>/portal`).
 3. Watch the page's status card turn **TELEMETRY SENT**, then keep it open
-   until the launcher prints the applet banner (and, with `--auto-probe`,
-   the 32439 verdict).
+   until the launcher prints the applet banner. Kit pages you swapped in
+   journal their reports as they run.
 
 ## What success looks like
 
@@ -106,14 +121,12 @@ launcher.
 - A `runs/…/telemetry/rig-*.jsonl` line exists with `ua` containing
   `WifiWebAuthApplet` and `AppleWebKit/` — the primary evidence the entry
   surface is live on your firmware.
-- With `--auto-probe`: a second telemetry line with
-  `"probe": "cve-2023-32439"` and an `overall` verdict of
-  `VULNERABLE-INDICATED | CLEAN | CRASHED | UNKNOWN` (or
-  `NEGATIVE-CONTROL-FAILED`, which would falsify the fork model — see
-  `docs/WEBKIT-BACKPORT-CHECK.md`). UNKNOWN means FTL tier-up could not be
-  confirmed on that load; re-run before reading it as clean.
-- `exit-summary.json` in the session journal tracks per-console-IP state:
-  first-seen, probe-served, probe-verdict.
+- Swapped kit pages produce `data.page` lines (`capsweep` full census,
+  `wsagent` connect/heartbeat status, `fontchain` phased verdicts) and
+  `page_report` events in the session journal.
+- `exit-summary.json` in the session journal tracks per-console-IP
+  first-seen state and teardown results (including the port-release
+  verification).
 
 ## Advanced — manual paths (no launch.py)
 
@@ -131,7 +144,10 @@ replacement. Then `sudo python3 tools/webkit-rig/portal.py --ip
 ```sh
 sudo python3 tools/webkit-rig/dns.py --ip <bench-lan-ip>            # must be :53
 sudo python3 tools/webkit-rig/portal.py --ip <bench-lan-ip>         # must be :80
-python3 tools/webkit-rig/portal.py --ip <bench-lan-ip> --port 8080 --probe-page tools/webkit-rig/probe-32439.html   # high-port lab variant
+python3 tools/webkit-rig/portal.py --ip <bench-lan-ip> --port 8080  # high-port lab variant
+# manual 32439 inverted no-JIT falsifier (retired from the auto-chain):
+python3 tools/webkit-rig/portal.py --ip <bench-lan-ip> --port 8080 --probe-page tools/webkit-rig/probe-32439.html
+curl -X POST 'http://127.0.0.1:8080/rig/swap'   # then serve it at /portal
 ```
 
 Console: DNS Settings → Manual → Primary DNS = `<bench-lan-ip>`. Both
@@ -168,7 +184,8 @@ curl -H 'Host: ctest.cdn.nintendo.net' http://<bench-lan-ip>/   # -> 302 to /por
 | DNS leg dead | dns.py not reachable on :53 — check sudo/redirect, check the console's DNS screen really shows the bench IP. |
 | HTTP leg dead | port 80 already in use (`lsof -nP -iTCP:80 -sTCP:LISTEN`) — stop the other service, or let launch.py's redirect/fallback handle it. |
 | page loads but no telemetry | check `/portal` really rendered the probe (Information button); the page retries with backoff for ~16 s — watch the access log for `/report` POSTs. |
-| 32439 verdict UNKNOWN | FTL tier-up wasn't confirmed on that load (stage-A ratio under threshold); keep the applet open and re-run — the detector refuses to say CLEAN without FTL evidence. |
+| 32439 page (manual falsifier) | stage-A `jit_tiering_likely` would FALSIFY the no-JIT model — re-check the engine config before anything else. Stage-B variant verdicts are meaningless on this no-JIT console (the miscompile lives in FTL); the page is otherwise retired. |
+| port 80/443/53/8080/5353 busy at startup | launch.py's hygiene pass reaps STALE webkit-rig listeners automatically and logs each; a NON-rig holder is reported (pid + command) and never touched — free it yourself or change ports. |
 
 ## Safety notes
 
