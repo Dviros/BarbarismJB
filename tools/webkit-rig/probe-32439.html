@@ -1,0 +1,605 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Network sign-in</title>
+<style>
+  /* Self-contained: no external assets ever leave this page. Same dark,
+     large-type card as the schema-1 probe page -- the Switch screen is
+     small and often across the room. */
+  html, body { margin: 0; padding: 0; background: #101318; color: #e8eaf0;
+               font-family: sans-serif; }
+  #rig-card { max-width: 900px; margin: 24px auto; padding: 20px 24px;
+              background: #1a1f2b; border: 1px solid #2c3446; border-radius: 10px; }
+  #rig-card h1 { font-size: 24px; margin: 0 0 4px 0; }
+  #rig-card h2 { font-size: 14px; font-weight: normal; color: #8f9ab3;
+                 margin: 0 0 16px 0; }
+  #rig-state { display: inline-block; padding: 2px 10px; border-radius: 6px;
+               font-size: 14px; background: #3a4460; }
+  #rig-state.done { background: #2e6b3a; }
+  #rig-state.vuln { background: #7a2e35; }
+  #rig-state.failed { background: #7a2e35; }
+  table { width: 100%; border-collapse: collapse; font-size: 17px; }
+  td { padding: 5px 6px; border-bottom: 1px solid #262d3d; vertical-align: top; }
+  td.k { color: #9fb0d8; white-space: nowrap; width: 40%; }
+  td.v { word-break: break-all; font-family: monospace; font-size: 15px; }
+  .note { color: #8f9ab3; font-size: 13px; margin-top: 14px; }
+</style>
+</head>
+<body>
+<div id="rig-card">
+  <h1>Network sign-in</h1>
+  <h2>CVE-2023-32439 behavioral miscompile detector &mdash; BarbarismJB
+      webkit-rig auto-probe (served after the first applet telemetry)</h2>
+  <div id="rig-state">RUNNING</div>
+  <table id="rig-rows">
+    <tr><td class="k">user agent</td><td class="v" id="rig-ua">probing&hellip;</td></tr>
+    <tr><td class="k">page url</td><td class="v" id="rig-url">&nbsp;</td></tr>
+    <tr><td class="k">stage A &mdash; tiering</td><td class="v" id="rig-a">pending</td></tr>
+    <tr><td class="k">B1 int32-hole for-in</td><td class="v" id="rig-b1">pending</td></tr>
+    <tr><td class="k">B2 double-hole for-in</td><td class="v" id="rig-b2">pending</td></tr>
+    <tr><td class="k">B3 property&rarr;indexed</td><td class="v" id="rig-b3">pending</td></tr>
+    <tr><td class="k">B4 accessor mid-enum</td><td class="v" id="rig-b4">pending</td></tr>
+    <tr><td class="k">B5 proto-chain change</td><td class="v" id="rig-b5">pending</td></tr>
+    <tr><td class="k">stage C &mdash; Enki control</td><td class="v" id="rig-c">pending</td></tr>
+    <tr><td class="k">overall verdict</td><td class="v" id="rig-overall">pending</td></tr>
+    <tr><td class="k">telemetry</td><td class="v" id="rig-post">pending</td></tr>
+  </table>
+  <div class="note">Keep this page open until the state chip changes. Nothing
+      is sent anywhere except this bench host. Probe schema 1, marker
+      cve-2023-32439 (see docs/RIG.md).</div>
+</div>
+<noscript><div style="color:#e8eaf0;padding:20px">
+  JavaScript did not run: the applet blocked scripting or the page did not
+  load. Record this -- it is a negative result for the probe.</div></noscript>
+<script>
+/* BarbarismJB webkit-rig probe page: CVE-2023-32439 behavioral detector.
+ *
+ * PROVENANCE -- BUILT FROM THE PUBLIC ROOT-CAUSE SHAPE, NOT A COPIED POC.
+ * We do not have a public PoC for this bug. This page reconstructs the
+ * trigger shape from the published root causes (docs/WEBKIT-NDAYS.md 2.2 /
+ * 3.1; docs/WEBKIT-BACKPORT-CHECK.md 5; pksecurity and shxdow RCAs):
+ *
+ *   DFGClobberize at the fork point made EnumeratorNextUpdateIndexAndMode
+ *   and HasIndexedProperty def the SAME HeapLocation (HasIndexedPropertyLoc
+ *   over IndexedInt32/Double/ContiguousProperties, same base+index). FTL
+ *   GCSE then substitutes the enumerator's index-update node (a NUMBER,
+ *   SpecBytecodeNumber) where HasIndexedProperty's node (a BOOLEAN) was
+ *   expected. The miscompiled value is observable when an `in` result is
+ *   used ARITHMETICALLY: spec engines contribute 0/1; a substituted
+ *   enumerator index contributes the raw index number.
+ *
+ * Method: for each variant, run the trigger COLD many times to record
+ * engine-self ground truth for fixed inputs, then >= 120k HOT runs (past
+ * the stock FTL tier-up counters, NDAYS 1.2) and compare. Any hot output
+ * that differs from cold ground truth -- wrong value, non-boolean leaking
+ * into numeric arithmetic, or an exception only in the hot phase -- is
+ * divergence => VULNERABLE-INDICATED for that variant.
+ *
+ * Stage C is the Enki definePropertyOnReceiver negative control: the fix is
+ * confirmed backported in wkc3 (BACKPORT-CHECK 2), so this stage MUST
+ * behave spec-correctly on the console; any divergence falsifies our fork
+ * model => NEGATIVE-CONTROL-FAILED.
+ *
+ * ES5-only like portal.html (no arrows, let/const, template literals); the
+ * stage-C class syntax lives inside new Function() strings. Two-phase
+ * telemetry (phase env immediately, phase verdict at the end) so a crash at
+ * any stage still leaves a line on the bench with a CRASH@stage marker.
+ * The server templates {{RIG_HOST}}/{{RIG_PORT}}; unfilled tokens (file
+ * opened directly) fall back to location.host.
+ */
+
+var RIG_SCHEMA = 1;
+var RIG_PROBE = "cve-2023-32439";
+var RIG_HOST = "{{RIG_HOST}}";
+var RIG_PORT = "{{RIG_PORT}}";
+var RIG_FILLED = RIG_HOST.indexOf("{{") !== 0;
+var RIG_BASE = RIG_FILLED
+    ? "http://" + RIG_HOST + ":" + RIG_PORT
+    : (location.protocol + "//" + location.host);
+
+var R = {
+  schema: RIG_SCHEMA,
+  probe: RIG_PROBE,
+  phase: "boot",
+  seq: 0,
+  startedAt: (new Date()).toISOString(),
+  stage: "boot",
+  rig: { templated: RIG_FILLED ? (RIG_HOST + ":" + RIG_PORT) : null,
+         base: RIG_BASE, pageHost: location.host },
+  page: { url: location.href, referrer: document.referrer || null,
+          protocol: location.protocol },
+  env: {},
+  tiering: null,
+  variants: [],
+  negative_control: null,
+  overall: null,
+  errors: []
+};
+
+var SEEDS = 8;              /* fixed input seeds: ground truth per seed */
+var COLD_RUNS = 48;         /* interpreted/baseline runs per seed */
+var HOT_RUNS = 120000;      /* past the ~100k FTL invocation counter */
+var HOT_BUDGET_MS = 2500;   /* per-variant wall-clock cap on slow engines */
+var MAX_MISMATCH_REPORT = 64;
+
+function fail(stage, e) {
+  if (R.errors.length < 20) {
+    R.errors.push({ stage: stage, error: String(e && e.message ? e.message : e) });
+  }
+}
+function $(id) { return document.getElementById(id); }
+function setRow(id, text) { try { $(id).textContent = String(text); } catch (e) {} }
+function setState(text, cls) {
+  try { var el = $("rig-state"); el.textContent = text;
+        el.className = cls || ""; } catch (e) {}
+}
+function nowMs() {
+  try {
+    if (typeof performance !== "undefined" && performance &&
+        typeof performance.now === "function") {
+      return performance.now();
+    }
+  } catch (e) {}
+  return Date.now();
+}
+function syntaxOk(code) {
+  try { new Function(code); return true; } catch (e) { return false; }
+}
+
+/* ------------------------------------------------------- transport */
+/* Same proven sendJson/viaXhr/backoff trio as the schema-1 page. */
+function sendJson(url, obj, cb) {
+  var payload;
+  try { payload = JSON.stringify(obj); }
+  catch (e) { fail("post.stringify", e); cb(false); return; }
+  if (typeof fetch === "function") {
+    fetch(url, { method: "POST",
+                 headers: { "Content-Type": "application/json" },
+                 body: payload })
+      .then(function (res) { cb(!!res && res.ok); })
+      .catch(function () { viaXhr(url, payload, cb); });
+    return;
+  }
+  viaXhr(url, payload, cb);
+}
+function viaXhr(url, payload, cb) {
+  if (typeof XMLHttpRequest === "undefined") { cb(false, "no transport"); return; }
+  var done = false;
+  function finish(ok, why) {
+    if (!done) { done = true; cb(ok, why); }
+  }
+  try {
+    var xhr = new XMLHttpRequest();
+    xhr.open("POST", url, true);
+    xhr.timeout = 5000;
+    xhr.setRequestHeader("Content-Type", "application/json");
+    xhr.onreadystatechange = function () {
+      if (xhr.readyState === 4) {
+        finish(xhr.status >= 200 && xhr.status < 300);
+      }
+    };
+    xhr.onerror = function () { finish(false, "xhr.onerror"); };
+    xhr.ontimeout = function () { finish(false, "xhr.ontimeout"); };
+    xhr.send(payload);
+  } catch (e) { fail("post.xhr", e); finish(false, "xhr.threw"); }
+}
+var BACKOFF_MS = [250, 500, 1000, 2000, 4000, 8000];
+function postReport(phase, cb) {
+  var attempts = 0;
+  function attempt() {
+    attempts++;
+    R.phase = phase;
+    R.seq++;
+    sendJson(RIG_BASE + "/report", R, function (ok, why) {
+      if (ok) { cb(true, attempts); return; }
+      if (attempts <= BACKOFF_MS.length) {
+        setRow("rig-post", "retry " + attempts + " in " + BACKOFF_MS[attempts - 1] + "ms");
+        setTimeout(attempt, BACKOFF_MS[attempts - 1]);
+      } else {
+        cb(false, attempts);
+      }
+    });
+  }
+  attempt();
+}
+
+/* ------------------------------------------- stage A: tiering check */
+/* FTL engagement is a PRECONDITION for the 32439 miscompile (the bad
+ * substitution happens in FTL GCSE). Same calibrated cold/hot micro-batch
+ * heuristic as the schema-1 page: interpreters show flat batch times, a
+ * tiering JIT makes later batches clearly cheaper. */
+function median3(a) {
+  var c = a.slice(0).sort(function (x, y) { return x - y; });
+  return c[Math.floor(c.length / 2)];
+}
+function jitProbe(budgetMs) {
+  var arr = [], i;
+  for (i = 0; i < 1024; i++) { arr.push(i * 0.25); }
+  function kern(n) {
+    var a = arr[n & 1023], b = arr[(n + 511) & 1023];
+    arr[n & 1023] = (a * 1.0000003 + b * 2.0000001) % 1e9;
+    return arr[n & 1023];
+  }
+  var per = 256, t0, elapsed;
+  for (i = 0; i < 14; i++) {
+    t0 = nowMs();
+    for (var j = 0; j < per; j++) { kern(j); }
+    elapsed = nowMs() - t0;
+    if (elapsed >= 8) { break; }
+    per *= 2;
+  }
+  var BATCHES = 20, times = [], started = nowMs(), b;
+  for (b = 0; b < BATCHES; b++) {
+    if (nowMs() - started > budgetMs) { break; }
+    t0 = nowMs();
+    for (var k = 0; k < per; k++) { kern(k); }
+    times.push(nowMs() - t0);
+  }
+  var out = { itersPerBatch: per, batches: times.length,
+              note: "FTL is a precondition for 32439; heuristic ratio" };
+  if (times.length >= 6) {
+    var cold = median3(times.slice(0, 3));
+    var hot = median3(times.slice(-3));
+    out.coldMs = Math.round(cold * 100) / 100;
+    out.hotMs = Math.round(hot * 100) / 100;
+    out.ratio = (hot > 0) ? Math.round((cold / hot) * 1000) / 1000 : null;
+    out.verdict = (out.ratio === null) ? "inconclusive"
+        : (out.ratio >= 2.5) ? "jit_tiering_likely"
+        : (out.ratio >= 1.4) ? "warmup_or_baseline"
+        : "no_speedup";
+  } else {
+    out.verdict = "inconclusive_few_batches";
+  }
+  arr = null;
+  return out;
+}
+
+/* ---------------------------------------- stage B: the variants */
+/* Each variant is its own sandbox: build(seed) makes fresh, deterministic
+ * state; victim(state, seed) contains the enumerator + the `in` check in
+ * ONE function (both nodes must share a DFG graph for the GCSE collision),
+ * with the `in` result consumed numerically so a substituted number leaks
+ * into the arithmetic result. */
+function makeVariants() {
+  var vs = [];
+
+  /* B1 -- RCA's primary shape: for-in (IndexedMode) over a holey Int32
+   * array; `in` on the same array, numeric use. */
+  vs.push({
+    name: "int32-hole-forin",
+    build: function (seed) {
+      var a = [], i;
+      for (i = 0; i < 16; i++) { a.push((i * 3) | 0); }
+      delete a[seed & 15];
+      return a;
+    },
+    victim: function (a, seed) {
+      var acc = 0, k;
+      for (k in a) {
+        acc += (k in a);
+        acc += (+k) & 7;
+      }
+      acc += (String(seed & 15) in a) ? 1 : 2;
+      return acc;
+    }
+  });
+
+  /* B2 -- same shape over a Double array (IndexedDoubleProperties, the
+   * second heap in the colliding def). */
+  vs.push({
+    name: "double-hole-forin",
+    build: function (seed) {
+      var a = [], i;
+      for (i = 0; i < 16; i++) { a.push(i + 0.5); }
+      delete a[(seed >> 1) & 15];
+      return a;
+    },
+    victim: function (a, seed) {
+      var acc = 0, k;
+      for (k in a) {
+        acc += (k in a);
+        acc += (+k) & 3;
+      }
+      acc += (String((seed >> 1) & 15) in a) ? 1 : 2;
+      return acc;
+    }
+  });
+
+  /* B3 -- property-to-indexed transition: named-only object gains indexed
+   * elements via a side effect inside the enumeration (the state change
+   * the optimizer must model around the enumerator update). */
+  vs.push({
+    name: "property-to-indexed",
+    build: function (seed) {
+      return { p0: seed & 1, p1: 2, p2: 3, p3: 5 };
+    },
+    victim: function (o) {
+      var acc = 0, k, n = 0;
+      for (k in o) {
+        if (n === 1) {
+          o[9] = 11;
+          o[10] = 13;
+        }
+        acc += (k in o);
+        n++;
+      }
+      return acc * 10 + n;
+    }
+  });
+
+  /* B4 -- accessor introduction mid-enumeration: structure transitions to
+   * an accessor-carrying shape inside the loop. */
+  vs.push({
+    name: "accessor-mid-enum",
+    build: function (seed) {
+      return { a: 1, b: 2, c: 3, d: seed & 7 };
+    },
+    victim: function (o) {
+      var acc = 0, k, n = 0;
+      for (k in o) {
+        if (n === 0) {
+          Object.defineProperty(o, "zz", {
+            get: function () { return 4; },
+            configurable: true, enumerable: true
+          });
+        }
+        acc += (k in o);
+        n++;
+      }
+      return acc * 10 + n;
+    }
+  });
+
+  /* B5 -- prototype-chain change: the prototype gains a property
+   * mid-enumeration; `in` sees through the prototype chain. */
+  vs.push({
+    name: "proto-chain-change",
+    build: function (seed) {
+      function B() {}
+      B.prototype = { q: 1, r: 2 };
+      var o = new B();
+      o.own1 = seed & 3;
+      return { o: o, proto: B.prototype };
+    },
+    victim: function (pair) {
+      var o = pair.o, acc = 0, k, n = 0;
+      for (k in o) {
+        if (n === 0) { pair.proto.added = 7; }
+        acc += (k in o);
+        n++;
+      }
+      return acc * 10 + n;
+    }
+  });
+
+  return vs;
+}
+
+function runVariant(v) {
+  var out = { name: v.name, cold: null, hot: null, firstDivergence: null,
+              verdict: "MATCH" };
+
+  /* cold: engine-self ground truth per seed; every cold run must agree */
+  var truth = [], s, i, val, first, stable = true;
+  try {
+    for (s = 0; s < SEEDS; s++) {
+      first = null;
+      for (i = 0; i < COLD_RUNS; i++) {
+        val = v.victim(v.build(s), s);
+        if (first === null) { first = val; }
+        else if (val !== first) { stable = false; }
+      }
+      truth.push(first);
+    }
+  } catch (e) {
+    fail("stageB." + v.name + ".cold", e);
+    out.verdict = "ERROR";
+    out.stage = "CRASHED@stageB." + v.name + ".cold";
+    out.error = String(e && e.message ? e.message : e);
+    return out;
+  }
+  out.cold = { runs: COLD_RUNS * SEEDS, truth: truth };
+  if (!stable) {
+    out.verdict = "UNSTABLE-COLD";
+    return out;
+  }
+
+  /* hot: >= HOT_RUNS invocations (FTL), bounded by wall clock */
+  var runs = 0, mismatches = 0, firstDiv = null, t0 = nowMs();
+  try {
+    while (runs < HOT_RUNS) {
+      s = runs & (SEEDS - 1);
+      val = v.victim(v.build(s), s);
+      if (val !== truth[s]) {
+        mismatches++;
+        if (!firstDiv) {
+          firstDiv = { run: runs, seed: s, got: String(val), want: truth[s] };
+        }
+        if (mismatches >= MAX_MISMATCH_REPORT) { break; }
+      }
+      runs++;
+      if ((runs & 8191) === 0 && nowMs() - t0 > HOT_BUDGET_MS) { break; }
+    }
+  } catch (e) {
+    /* an exception ONLY in the hot phase is divergence per the method */
+    fail("stageB." + v.name + ".hot", e);
+    out.hot = { runs: runs, mismatches: mismatches };
+    out.verdict = "VULNERABLE-INDICATED";
+    out.stage = "CRASHED@stageB." + v.name + ".hot";
+    out.error = String(e && e.message ? e.message : e);
+    return out;
+  }
+  out.hot = { runs: runs, mismatches: mismatches,
+              ms: Math.round((nowMs() - t0) * 100) / 100 };
+  out.firstDivergence = firstDiv;
+  if (mismatches > 0) { out.verdict = "VULNERABLE-INDICATED"; }
+  return out;
+}
+
+/* ----------------------------- stage C: Enki negative control */
+/* Spec (OrdinarySetWithOwnDescriptor: receiver holds a non-configurable
+ * but WRITABLE data property, the base chain holds none) makes
+ * `super.prototype = o` on an instance of a class extending Function a
+ * plain VALUE WRITE to the receiver's own 'prototype': legal, no throw,
+ * value updated, and the property must STAY a non-configurable data
+ * property -- so a later defineProperty-as-accessor still throws
+ * TypeError. The vulnerable engine (Enki writeup; the fork-point source
+ * shape in BACKPORT-CHECK 1.2) instead REPLACED the descriptor, silently
+ * converting the non-configurable 'prototype' into a configurable OOL
+ * property, after which an accessor could be attached -- the prototype
+ * confusion. BACKPORT-CHECK 2 confirms the guard IS backported in wkc3,
+ * so on the console this stage MUST pass; any divergence falsifies our
+ * fork model => NEGATIVE-CONTROL-FAILED. */
+function stageC() {
+  if (!syntaxOk("class Fx extends Function {}")) {
+    return { supported: false, verdict: "UNSUPPORTED" };
+  }
+  var src =
+    "'use strict';\n" +
+    "class F extends Function { setP(o) { super.prototype = o; } }\n" +
+    "var f = new F('return 7;');\n" +
+    "var probe = { marker: 1234 };\n" +
+    "var before = Object.getOwnPropertyDescriptor(f, 'prototype');\n" +
+    "var setErr = null;\n" +
+    "try { f.setP(probe); } catch (e) { setErr = String(e); }\n" +
+    "var after = Object.getOwnPropertyDescriptor(f, 'prototype');\n" +
+    "var redefine = null;\n" +
+    "try {\n" +
+    "  Object.defineProperty(f, 'prototype',\n" +
+    "      { get: function () { return 9; }, configurable: true });\n" +
+    "  redefine = 'succeeded';\n" +
+    "} catch (e) { redefine = 'threw:' + String(e); }\n" +
+    "var last = Object.getOwnPropertyDescriptor(f, 'prototype');\n" +
+    "return { setErr: setErr, valueUpdated: f.prototype === probe,\n" +
+    "  cfgBefore: before && before.configurable,\n" +
+    "  cfgAfter: after && after.configurable,\n" +
+    "  dataAfter: !!after && ('value' in after),\n" +
+    "  redefine: redefine,\n" +
+    "  cfgLast: last && last.configurable,\n" +
+    "  dataLast: !!last && ('value' in last) };\n";
+  var out;
+  try {
+    out = new Function(src)();
+  } catch (e) {
+    fail("stageC", e);
+    return { supported: true, verdict: "NEGATIVE-CONTROL-FAILED",
+             detail: { hardError: String(e) } };
+  }
+  var pass = out.setErr === null &&
+             out.valueUpdated === true &&
+             out.cfgBefore === false && out.cfgAfter === false &&
+             out.dataAfter === true &&
+             typeof out.redefine === "string" &&
+             out.redefine.indexOf("threw:TypeError") !== -1 &&
+             out.cfgLast === false && out.dataLast === true;
+  return { supported: true, verdict: pass ? "PASS" : "NEGATIVE-CONTROL-FAILED",
+           detail: out };
+}
+
+/* ----------------------------------------------------------- verdict */
+function computeOverall() {
+  if (R.negative_control &&
+      R.negative_control.verdict === "NEGATIVE-CONTROL-FAILED") {
+    return "NEGATIVE-CONTROL-FAILED";
+  }
+  var indicated = false, errored = false;
+  for (var i = 0; i < R.variants.length; i++) {
+    if (R.variants[i].verdict === "VULNERABLE-INDICATED") { indicated = true; }
+    if (R.variants[i].verdict === "ERROR" ||
+        R.variants[i].verdict === "UNSTABLE-COLD") { errored = true; }
+  }
+  if (indicated) { return "VULNERABLE-INDICATED"; }
+  if (!R.tiering || R.tiering.verdict !== "jit_tiering_likely") {
+    /* FTL not proven engaged: cannot assert CLEAN */
+    return "UNKNOWN";
+  }
+  if (errored) { return "UNKNOWN"; }
+  return "CLEAN";
+}
+
+/* ----------------------------------------------------------- driver */
+function variantRow(v) {
+  if (!v.hot && v.verdict !== "MATCH") {
+    return v.verdict + " (" + (v.stage || "") + (v.error ? " " + v.error : "") + ")";
+  }
+  var div = v.firstDivergence
+      ? " first@run " + v.firstDivergence.run +
+        " seed " + v.firstDivergence.seed +
+        " got " + v.firstDivergence.got + " want " + v.firstDivergence.want
+      : "";
+  return v.verdict + " (hot " + v.hot.runs + " runs, " +
+         v.hot.mismatches + " mismatches" + div + ")";
+}
+
+function run() {
+  setRow("rig-url", location.href);
+  R.env = { userAgent: navigator.userAgent,
+            language: navigator.language || null,
+            hardwareConcurrency: (typeof navigator.hardwareConcurrency === "number")
+                ? navigator.hardwareConcurrency : null };
+  setRow("rig-ua", R.env.userAgent || "(no navigator.userAgent)");
+
+  /* phase 1: identity + tiering snapshot out immediately (crash insurance) */
+  R.stage = "stageA";
+  try {
+    R.tiering = jitProbe(1200);
+    setRow("rig-a", (R.tiering.verdict || "?") +
+            (R.tiering.ratio != null ? " (cold/hot " + R.tiering.ratio + ")" : ""));
+  } catch (e) {
+    fail("stageA", e);
+    setRow("rig-a", "probe failed: " + String(e));
+  }
+  postReport("env", function (ok, attempts) {
+    setRow("rig-post", ok ? "sent (env, " + attempts + " attempt(s))" :
+                            "FAILED after " + attempts + " attempts");
+  });
+
+  /* phase 2 stages */
+  R.stage = "stageB";
+  var vs = makeVariants(), i;
+  for (i = 0; i < vs.length; i++) {
+    var res = runVariant(vs[i]);
+    R.variants.push(res);
+    setRow("rig-b" + (i + 1), variantRow(res));
+  }
+
+  R.stage = "stageC";
+  R.negative_control = stageC();
+  setRow("rig-c", R.negative_control.supported === false
+          ? "unsupported (no class syntax)"
+          : R.negative_control.verdict);
+
+  R.stage = "done";
+  R.overall = computeOverall();
+  setRow("rig-overall", R.overall);
+  setState(R.overall, R.overall === "CLEAN" ? "done" : "vuln");
+
+  postReport("verdict", function (ok, attempts) {
+    if (ok) {
+      setRow("rig-post", "sent (env+verdict, " + attempts + " attempt(s))");
+      if (R.overall === "CLEAN") { setState("TELEMETRY SENT", "done"); }
+    } else {
+      setState("SEND FAILED", "failed");
+    }
+  });
+}
+
+try {
+  run();
+} catch (e) {
+  /* Last-ditch: phase-1 line may already be on the bench; make the crash
+   * stage visible in the final attempt. */
+  fail("driver", e);
+  R.stage = "CRASHED@" + (R.stage || "driver");
+  R.overall = "CRASHED";
+  setState("PROBE CRASHED", "failed");
+  setRow("rig-overall", R.stage);
+  try {
+    postReport("crash", function () {});
+  } catch (e2) {}
+}
+</script>
+</body>
+</html>

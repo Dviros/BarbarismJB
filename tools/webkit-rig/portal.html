@@ -1,0 +1,453 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Network sign-in</title>
+<style>
+  /* Self-contained: no external assets ever leave this page. Dark, large
+     type -- the Switch screen is small and often across the room. */
+  html, body { margin: 0; padding: 0; background: #101318; color: #e8eaf0;
+               font-family: sans-serif; }
+  #rig-card { max-width: 900px; margin: 24px auto; padding: 20px 24px;
+              background: #1a1f2b; border: 1px solid #2c3446; border-radius: 10px; }
+  #rig-card h1 { font-size: 24px; margin: 0 0 4px 0; }
+  #rig-card h2 { font-size: 14px; font-weight: normal; color: #8f9ab3;
+                 margin: 0 0 16px 0; }
+  #rig-state { display: inline-block; padding: 2px 10px; border-radius: 6px;
+               font-size: 14px; background: #3a4460; }
+  #rig-state.done { background: #2e6b3a; }
+  #rig-state.failed { background: #7a2e35; }
+  table { width: 100%; border-collapse: collapse; font-size: 17px; }
+  td { padding: 5px 6px; border-bottom: 1px solid #262d3d; vertical-align: top; }
+  td.k { color: #9fb0d8; white-space: nowrap; width: 40%; }
+  td.v { word-break: break-all; font-family: monospace; font-size: 15px; }
+  .note { color: #8f9ab3; font-size: 13px; margin-top: 14px; }
+</style>
+</head>
+<body>
+<div id="rig-card">
+  <h1>Network sign-in</h1>
+  <h2>BarbarismJB webkit-rig probe &mdash; this page is running in the
+      Switch captive-portal applet</h2>
+  <div id="rig-state">RUNNING</div>
+  <table id="rig-rows">
+    <tr><td class="k">user agent</td><td class="v" id="rig-ua">probing&hellip;</td></tr>
+    <tr><td class="k">page url</td><td class="v" id="rig-url">&nbsp;</td></tr>
+    <tr><td class="k">environment</td><td class="v" id="rig-env">pending</td></tr>
+    <tr><td class="k">features</td><td class="v" id="rig-feat">pending</td></tr>
+    <tr><td class="k">jsc tiering</td><td class="v" id="rig-jit">pending</td></tr>
+    <tr><td class="k">websocket</td><td class="v" id="rig-ws">pending</td></tr>
+    <tr><td class="k">telemetry</td><td class="v" id="rig-post">pending</td></tr>
+  </table>
+  <div class="note">Keep this page open until the state chip turns green.
+      Nothing here is sent anywhere except this bench host. Probe schema 1
+      (see docs/RIG.md).</div>
+</div>
+<noscript><div style="color:#e8eaf0;padding:20px">
+  JavaScript did not run: the applet blocked scripting or the page did not
+  load. Record this -- it is a negative result for the entry surface.</div></noscript>
+<script>
+/* BarbarismJB webkit-rig probe page.
+ *
+ * Runs in the Switch's WifiWebAuthApplet (WebKit/WKC 613-era / 2.39-window
+ * fork, docs/WEBKIT-ANALYSIS.md). Deliberately ES5-only: no arrow functions,
+ * no let/const, no template literals -- nothing the engine might not parse.
+ * Every probe is guarded; a missing feature is reported, never thrown.
+ * The server templates {{RIG_HOST}}/{{RIG_PORT}}; if the tokens are unfilled
+ * (file opened directly) we fall back to location.host. */
+
+var RIG_SCHEMA = 1;
+var RIG_HOST = "{{RIG_HOST}}";
+var RIG_PORT = "{{RIG_PORT}}";
+var RIG_FILLED = RIG_HOST.indexOf("{{") !== 0;
+var RIG_BASE = RIG_FILLED
+    ? "http://" + RIG_HOST + ":" + RIG_PORT
+    : (location.protocol + "//" + location.host);
+
+var R = {
+  schema: RIG_SCHEMA,
+  phase: "boot",
+  seq: 0,
+  startedAt: (new Date()).toISOString(),
+  rig: { templated: RIG_FILLED ? (RIG_HOST + ":" + RIG_PORT) : null,
+         base: RIG_BASE, pageHost: location.host },
+  page: { url: location.href, referrer: document.referrer || null,
+          protocol: location.protocol },
+  env: {}, features: {}, syntax: {}, jit: null, ws: null,
+  posts: {}, errors: []
+};
+
+function fail(stage, e) {
+  if (R.errors.length < 20) {
+    R.errors.push({ stage: stage, error: String(e && e.message ? e.message : e) });
+  }
+}
+function $(id) { return document.getElementById(id); }
+function setRow(id, text) { try { $(id).textContent = String(text); } catch (e) {} }
+function setState(text, cls) {
+  try { var el = $("rig-state"); el.textContent = text;
+        el.className = cls || ""; } catch (e) {}
+}
+
+/* ---------------------------------------------------------------- timers */
+function nowMs() {
+  try {
+    if (typeof performance !== "undefined" && performance &&
+        typeof performance.now === "function") {
+      return performance.now();
+    }
+  } catch (e) {}
+  return Date.now();
+}
+function timerName() {
+  return (typeof performance !== "undefined" && performance &&
+          typeof performance.now === "function")
+      ? "performance.now" : "Date.now";
+}
+
+/* --------------------------------------------------------- environment */
+function probeEnv() {
+  var n = navigator, s = screen, e = {};
+  e.userAgent = n.userAgent;
+  e.appVersion = n.appVersion || null;
+  e.platform = n.platform || null;
+  e.language = n.language || null;
+  try { e.languages = (n.languages || []).join(",") || null; } catch (x) { e.languages = null; }
+  e.cookieEnabled = !!n.cookieEnabled;
+  e.onLine = (typeof n.onLine === "boolean") ? n.onLine : null;
+  e.hardwareConcurrency = (typeof n.hardwareConcurrency === "number") ? n.hardwareConcurrency : null;
+  e.deviceMemory = (typeof n.deviceMemory === "number") ? n.deviceMemory : null;
+  e.maxTouchPoints = (typeof n.maxTouchPoints === "number") ? n.maxTouchPoints : null;
+  e.devicePixelRatio = window.devicePixelRatio || null;
+  if (s) {
+    e.screen = { width: s.width, height: s.height, availWidth: s.availWidth,
+                 availHeight: s.availHeight, colorDepth: s.colorDepth,
+                 pixelDepth: s.pixelDepth };
+  }
+  e.timezone = null;
+  try {
+    if (typeof Intl !== "undefined" && Intl.DateTimeFormat) {
+      e.timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || null;
+    }
+  } catch (x) { fail("env.timezone", x); }
+  e.tzOffsetMinutes = new Date().getTimezoneOffset();
+  e.timeNow = Date.now();
+  e.hasPerformanceNow = (timerName() === "performance.now");
+  e.gpuRenderer = null;
+  try {
+    var c = document.createElement("canvas");
+    var gl = c.getContext("webgl") || c.getContext("experimental-webgl");
+    if (gl) {
+      var dbg = gl.getExtension("WEBGL_debug_renderer_info");
+      if (dbg) { e.gpuRenderer = gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL); }
+      else { e.gpuRenderer = gl.getParameter(gl.RENDERER); }
+    }
+  } catch (x) { fail("env.webgl", x); }
+  return e;
+}
+
+/* ----------------------------------------------------------- features */
+/* typeof matrix. Several entries deliberately fingerprint the 2.39.1-window
+ * fork (docs/WEBKIT-ANALYSIS.md 2.2): Temporal/ShadowRealm present,
+ * structuredClone / iterator helpers / resizable AB / findLast expected
+ * present-or-absent per the option census. */
+var FEATURE_PROBES = [
+  ["fetch", function () { return typeof fetch; }],
+  ["XMLHttpRequest", function () { return typeof XMLHttpRequest; }],
+  ["WebSocket", function () { return typeof WebSocket; }],
+  ["Worker", function () { return typeof Worker; }],
+  ["SharedWorker", function () { return typeof SharedWorker; }],
+  ["serviceWorkerContainer", function () {
+      return ("serviceWorker" in navigator) ? "object" : "undefined"; }],
+  ["WebAssembly", function () { return typeof WebAssembly; }],
+  ["Proxy", function () { return typeof Proxy; }],
+  ["Reflect", function () { return typeof Reflect; }],
+  ["Symbol", function () { return typeof Symbol; }],
+  ["Promise", function () { return typeof Promise; }],
+  ["TextDecoder", function () { return typeof TextDecoder; }],
+  ["TextEncoder", function () { return typeof TextEncoder; }],
+  ["Atomics", function () { return typeof Atomics; }],
+  ["SharedArrayBuffer", function () { return typeof SharedArrayBuffer; }],
+  ["BigInt", function () { return typeof BigInt; }],
+  ["Temporal", function () { return typeof Temporal; }],
+  ["ShadowRealm", function () { return typeof ShadowRealm; }],
+  ["OffscreenCanvas", function () { return typeof OffscreenCanvas; }],
+  ["requestAnimationFrame", function () { return typeof requestAnimationFrame; }],
+  ["queueMicrotask", function () { return typeof queueMicrotask; }],
+  ["structuredClone", function () { return typeof structuredClone; }],
+  ["FinalizationRegistry", function () { return typeof FinalizationRegistry; }],
+  ["WeakRef", function () { return typeof WeakRef; }],
+  ["globalThis", function () { return typeof globalThis; }],
+  ["Intl.supportedValuesOf", function () {
+      return (typeof Intl !== "undefined" && Intl.supportedValuesOf)
+          ? "function" : "undefined"; }],
+  ["Array.prototype.findLast", function () {
+      return typeof (Array.prototype.findLast); }],
+  ["Array.prototype.at", function () { return typeof (Array.prototype.at); }],
+  ["Array.prototype.flat", function () { return typeof (Array.prototype.flat); }],
+  ["Object.hasOwn", function () { return typeof (Object.hasOwn); }],
+  ["String.prototype.replaceAll", function () {
+      return typeof (String.prototype.replaceAll); }],
+  ["ArrayBuffer.prototype.resize", function () {
+      return typeof (ArrayBuffer.prototype.resize); }],
+  ["Iterator", function () { return typeof Iterator; }],
+  ["Promise.withResolvers", function () {
+      return (typeof Promise !== "undefined" && Promise.withResolvers)
+          ? "function" : "undefined"; }]
+];
+function probeFeatures() {
+  var f = {};
+  for (var i = 0; i < FEATURE_PROBES.length; i++) {
+    try { f[FEATURE_PROBES[i][0]] = FEATURE_PROBES[i][1](); }
+    catch (e) { f[FEATURE_PROBES[i][0]] = "threw:" + String(e); }
+  }
+  return f;
+}
+
+/* Syntax-level probes: new Function() parses the string at construction
+ * WITHOUT executing it, so unsupported syntax throws and is caught here --
+ * the probe strings below are therefore safe even on an engine that could
+ * not parse them as part of this page's own source. */
+var SYNTAX_PROBES = [
+  ["arrowFunctions", "var g = (a) => a + 1;"],
+  ["asyncAwait", "async function f() { await 1; }"],
+  ["optionalChaining", "var x = o?.a;"],
+  ["nullishCoalescing", "var x = a ?? 1;"],
+  ["bigintLiteral", "var x = 1n;"],
+  ["classFields", "class C { x = 1; }"],
+  ["numericSeparators", "var x = 1_000;"],
+  ["logicalAssignment", "var o = {}; o.a ||= 1;"]
+];
+function syntaxOk(code) {
+  try { new Function(code); return true; } catch (e) { return false; }
+}
+function probeSyntax() {
+  var s = {};
+  for (var i = 0; i < SYNTAX_PROBES.length; i++) {
+    s[SYNTAX_PROBES[i][0]] = syntaxOk(SYNTAX_PROBES[i][1]);
+  }
+  /* RegExp feature probes construct at runtime, same effect. */
+  try { new RegExp("(?<=a)b"); s.regexLookbehind = true; }
+  catch (e) { s.regexLookbehind = false; }
+  try { new RegExp("(?<n>a)"); s.regexNamedGroups = true; }
+  catch (e) { s.regexNamedGroups = false; }
+  return s;
+}
+
+/* ------------------------------------------------- JSC tiering probe */
+/* HEURISTIC, documented as such: a hot float kernel is run in many batches;
+ * interpreters and baseline JITs show roughly flat per-batch time, while a
+ * tiering JIT (DFG/FTL) makes later batches clearly faster than the first
+ * ones. The cold/hot median ratio therefore *suggests* the tier, it does not
+ * prove it -- timer resolution, thermal state and GC all add noise.
+ * docs/WEBKIT-ANALYSIS.md 3.5 explains why this matters (is JIT on?). */
+function median3(a) {
+  var c = a.slice(0).sort(function (x, y) { return x - y; });
+  return c[Math.floor(c.length / 2)];
+}
+function jitProbe(budgetMs) {
+  var arr = [], i;
+  for (i = 0; i < 1024; i++) { arr.push(i * 0.25); }
+  function kern(n) {
+    var a = arr[n & 1023], b = arr[(n + 511) & 1023];
+    arr[n & 1023] = (a * 1.0000003 + b * 2.0000001) % 1e9;
+    return arr[n & 1023];
+  }
+  /* Calibrate: grow the batch until one batch takes >= ~8 ms so even
+   * Date.now's 1 ms resolution carries signal. */
+  var per = 256, t0, elapsed;
+  for (i = 0; i < 14; i++) {
+    t0 = nowMs();
+    for (var j = 0; j < per; j++) { kern(j); }
+    elapsed = nowMs() - t0;
+    if (elapsed >= 8) { break; }
+    per *= 2;
+  }
+  var BATCHES = 20, times = [], started = nowMs(), b;
+  for (b = 0; b < BATCHES; b++) {
+    if (nowMs() - started > budgetMs) { break; }
+    t0 = nowMs();
+    for (var k = 0; k < per; k++) { kern(k); }
+    times.push(nowMs() - t0);
+  }
+  var out = { timer: timerName(), itersPerBatch: per, batches: times.length,
+              batchMs: times, note: "heuristic cold/hot micro-benchmark" };
+  if (times.length >= 6) {
+    var cold = median3(times.slice(0, 3));
+    var hot = median3(times.slice(-3));
+    out.coldMs = Math.round(cold * 100) / 100;
+    out.hotMs = Math.round(hot * 100) / 100;
+    out.ratio = (hot > 0) ? Math.round((cold / hot) * 1000) / 1000 : null;
+    out.verdict = (out.ratio === null) ? "inconclusive"
+        : (out.ratio >= 2.5) ? "jit_tiering_likely"
+        : (out.ratio >= 1.4) ? "warmup_or_baseline"
+        : "no_speedup";
+  } else {
+    out.verdict = "inconclusive_few_batches";
+  }
+  /* Sink-hole the array so a bailing engine does not keep it hot. */
+  arr = null;
+  return out;
+}
+
+/* ------------------------------------------------------- transport */
+function sendJson(url, obj, cb) {
+  var payload;
+  try { payload = JSON.stringify(obj); }
+  catch (e) { fail("post.stringify", e); cb(false); return; }
+  if (typeof fetch === "function") {
+    fetch(url, { method: "POST",
+                 headers: { "Content-Type": "application/json" },
+                 body: payload })
+      .then(function (res) { cb(!!res && res.ok); })
+      .catch(function () { viaXhr(url, payload, cb); });
+    return;
+  }
+  viaXhr(url, payload, cb);
+}
+function viaXhr(url, payload, cb) {
+  if (typeof XMLHttpRequest === "undefined") { cb(false, "no transport"); return; }
+  var done = false;
+  function finish(ok, why) {
+    if (!done) { done = true; cb(ok, why); }
+  }
+  try {
+    var xhr = new XMLHttpRequest();
+    xhr.open("POST", url, true);
+    xhr.timeout = 5000;
+    xhr.setRequestHeader("Content-Type", "application/json");
+    xhr.onreadystatechange = function () {
+      if (xhr.readyState === 4) {
+        finish(xhr.status >= 200 && xhr.status < 300);
+      }
+    };
+    xhr.onerror = function () { finish(false, "xhr.onerror"); };
+    xhr.ontimeout = function () { finish(false, "xhr.ontimeout"); };
+    xhr.send(payload);
+  } catch (e) { fail("post.xhr", e); finish(false, "xhr.threw"); }
+}
+
+var BACKOFF_MS = [250, 500, 1000, 2000, 4000, 8000];
+function postReport(phase, cb) {
+  var attempts = 0;
+  function attempt() {
+    attempts++;
+    R.phase = phase;
+    R.seq++;
+    R.posts[phase] = { attempts: attempts, lastAt: (new Date()).toISOString() };
+    sendJson(RIG_BASE + "/report", R, function (ok, why) {
+      if (ok) { cb(true, attempts); return; }
+      if (why) { R.posts[phase].lastError = why; }
+      if (attempts <= BACKOFF_MS.length) {
+        setRow("rig-post", "retry " + attempts + " in " + BACKOFF_MS[attempts - 1] + "ms");
+        setTimeout(attempt, BACKOFF_MS[attempts - 1]);
+      } else {
+        cb(false, attempts);
+      }
+    });
+  }
+  attempt();
+}
+
+/* ------------------------------------------------------- websocket */
+function wsProbe(cb) {
+  if (typeof WebSocket === "undefined") { cb({ supported: false }); return; }
+  var res = { supported: true, opened: false, closed: false, closeCode: null,
+              url: RIG_BASE.replace(/^http/, "ws") + "/ws" };
+  var finished = false;
+  function finish() {
+    if (!finished) { finished = true; cb(res); }
+  }
+  var timer = setTimeout(function () {
+    res.timeout = true;
+    try { sock.close(); } catch (e) {}
+    finish();
+  }, 3000);
+  var sock;
+  try { sock = new WebSocket(res.url); }
+  catch (e) { res.error = String(e); clearTimeout(timer); finish(); return; }
+  sock.onopen = function () {
+    res.opened = true;
+    try { sock.send(JSON.stringify({ type: "rig-hello",
+                                     ua: navigator.userAgent })); }
+    catch (e) { fail("ws.send", e); }
+  };
+  sock.onmessage = function (ev) {
+    try { res.lastMessage = String(ev.data).slice(0, 200); } catch (e) {}
+  };
+  sock.onclose = function (ev) {
+    res.closed = true;
+    res.closeCode = ev && typeof ev.code === "number" ? ev.code : null;
+    clearTimeout(timer); finish();
+  };
+  sock.onerror = function () { res.errorEvent = true; };
+}
+
+/* ----------------------------------------------------------- driver */
+function featureSummary(f) {
+  var have = 0, total = 0;
+  for (var k in f) {
+    if (Object.prototype.hasOwnProperty.call(f, k)) {
+      total++;
+      if (f[k] === "function" || f[k] === "object") { have++; }
+    }
+  }
+  return have + "/" + total + " present";
+}
+
+function run() {
+  setRow("rig-url", location.href);
+  try { R.env = probeEnv(); } catch (e) { fail("env", e); }
+  setRow("rig-ua", R.env.userAgent || "(no navigator.userAgent)");
+  setRow("rig-env", (R.env.language || "?") + " / " +
+          (R.env.screen ? R.env.screen.width + "x" + R.env.screen.height : "?") +
+          " / tz " + (R.env.timezone || R.env.tzOffsetMinutes));
+  try { R.features = probeFeatures(); } catch (e) { fail("features", e); }
+  setRow("rig-feat", featureSummary(R.features));
+  try { R.syntax = probeSyntax(); } catch (e) { fail("syntax", e); }
+
+  /* Phase 1: environment snapshot goes out immediately so even a later
+   * crash still leaves a telemetry line on the bench. */
+  postReport("env", function (ok, attempts) {
+    setRow("rig-post", ok ? "sent (env, " + attempts + " attempt(s))" :
+                            "FAILED after " + attempts + " attempts");
+    if (!ok) { setState("ENV ONLY", "failed"); }
+  });
+
+  /* Phase 2: heavier probes, then the full report. */
+  try {
+    R.jit = jitProbe(1500);
+    setRow("rig-jit", (R.jit.verdict || "?") +
+            (R.jit.ratio != null ? " (cold/hot " + R.jit.ratio + ")" : ""));
+  } catch (e) { fail("jit", e); setRow("rig-jit", "probe failed: " + String(e)); }
+
+  wsProbe(function (ws) {
+    R.ws = ws;
+    setRow("rig-ws", !ws.supported ? "WebSocket missing" :
+            ws.opened ? "opened" :
+            ("unavailable" + (ws.closeCode != null ? " (close " + ws.closeCode + ")" : "")));
+    postReport("full", function (ok, attempts) {
+      if (ok) {
+        setRow("rig-post", "sent (env+full, " + attempts + " attempt(s))");
+        setState("TELEMETRY SENT", "done");
+      } else {
+        setState("SEND FAILED", "failed");
+      }
+    });
+  });
+}
+
+try {
+  run();
+} catch (e) {
+  /* Last-ditch: make the failure visible and try to ship one line. */
+  fail("driver", e);
+  setState("PROBE CRASHED", "failed");
+  try {
+    postReport("crash", function () {});
+  } catch (e2) {}
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,34 @@
+{
+ "sig-huge-first-int": {
+  "size": 788,
+  "sha256": "b3540d1868518ae8e951e43f91f8a3d1ed8f1705e8b3e33cfc15d8210cd08a0f"
+ },
+ "tbs-len-extended": {
+  "size": 789,
+  "sha256": "330b00c9516c9813dc83bd4bd405e488687c2bbeaeddc7c1868c38c393852d36"
+ },
+ "dup-tail-32": {
+  "size": 820,
+  "sha256": "c5c10dc5cf39749aa43700ed06addc477d1325ced89866b0b42d3f3c307a7064"
+ },
+ "last-ext-critical": {
+  "size": 788,
+  "sha256": "7aab0a6769bb2636657410888921f01c80930532b9bbd97b535b8a1d7f9ac9a7"
+ },
+ "trunc-3q": {
+  "size": 591,
+  "sha256": "30aeed4ec9577e179941d180b74790caf2cbc6c068a1841b443c0498bcee865f"
+ },
+ "trunc-7q": {
+  "size": 689,
+  "sha256": "e46fa97e95178331ef675f3d852e74128ccab965120316c8e4df6a09ea6ce163"
+ },
+ "sigoid-md5": {
+  "size": 788,
+  "sha256": "afa19b17a8def5696eec9df23473f2af6f5299f6dbcde0fd2e6cd5fcd55f0050"
+ },
+ "chain-x3": {
+  "size": 2364,
+  "sha256": "c86bb0b022a3dea01e38e0b65509e19b28ee24a6fb64160b7c1af478efac38c2"
+ }
+}

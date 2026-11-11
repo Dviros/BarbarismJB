@@ -1,0 +1,5 @@
+# Rig runtime artifacts — never commit (mirrors repo-root .gitignore).
+runs/
+stage/
+__pycache__/
+*.pyc

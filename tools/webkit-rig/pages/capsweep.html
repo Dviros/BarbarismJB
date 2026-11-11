@@ -1,0 +1,979 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Network sign-in</title>
+<style>
+  /* Self-contained: no external assets ever leave this page. Same dark,
+     large-type card as the schema-1 pages -- the Switch screen is small and
+     often across the room. */
+  html, body { margin: 0; padding: 0; background: #101318; color: #e8eaf0;
+               font-family: sans-serif; }
+  #rig-card { max-width: 900px; margin: 24px auto; padding: 20px 24px;
+              background: #1a1f2b; border: 1px solid #2c3446; border-radius: 10px; }
+  #rig-card h1 { font-size: 24px; margin: 0 0 4px 0; }
+  #rig-card h2 { font-size: 14px; font-weight: normal; color: #8f9ab3;
+                 margin: 0 0 16px 0; }
+  #rig-state { display: inline-block; padding: 2px 10px; border-radius: 6px;
+               font-size: 14px; background: #3a4460; }
+  #rig-state.done { background: #2e6b3a; }
+  #rig-state.failed { background: #7a2e35; }
+  table { width: 100%; border-collapse: collapse; font-size: 17px; }
+  td { padding: 5px 6px; border-bottom: 1px solid #262d3d; vertical-align: top; }
+  td.k { color: #9fb0d8; white-space: nowrap; width: 40%; }
+  td.v { word-break: break-all; font-family: monospace; font-size: 15px; }
+  .note { color: #8f9ab3; font-size: 13px; margin-top: 14px; }
+</style>
+</head>
+<body>
+<div id="rig-card">
+  <h1>Network sign-in</h1>
+  <h2>Capability census &mdash; BarbarismJB webkit-rig capsweep (one-shot,
+      auto-runs, POSTs one JSON result to the bench)</h2>
+  <div id="rig-state">RUNNING</div>
+  <table id="rig-rows">
+    <tr><td class="k">user agent</td><td class="v" id="rig-ua">probing&hellip;</td></tr>
+    <tr><td class="k">page url</td><td class="v" id="rig-url">&nbsp;</td></tr>
+    <tr><td class="k">environment</td><td class="v" id="rig-env">pending</td></tr>
+    <tr><td class="k">features (typeof matrix)</td><td class="v" id="rig-feat">pending</td></tr>
+    <tr><td class="k">localStorage</td><td class="v" id="rig-ls">pending</td></tr>
+    <tr><td class="k">websocket connect-back</td><td class="v" id="rig-ws">pending</td></tr>
+    <tr><td class="k">worker spawn</td><td class="v" id="rig-worker">pending</td></tr>
+    <tr><td class="k">canvas 2d readback</td><td class="v" id="rig-canvas">pending</td></tr>
+    <tr><td class="k">fontface (remote + local)</td><td class="v" id="rig-font">pending</td></tr>
+    <tr><td class="k">performance.now resolution</td><td class="v" id="rig-timer">pending</td></tr>
+    <tr><td class="k">C_LOOP timing fingerprint</td><td class="v" id="rig-cloop">pending</td></tr>
+    <tr><td class="k">telemetry</td><td class="v" id="rig-post">pending</td></tr>
+  </table>
+  <div class="note">Keep this page open until the state chip changes. The
+      remote-font probe intentionally requests a missing /stage file -- the
+      404 on the bench IS the result (remote FontFace fetch evidence).
+      Page marker capsweep (see docs/RIG.md).</div>
+</div>
+<noscript><div style="color:#e8eaf0;padding:20px">
+  JavaScript did not run: the applet blocked scripting or the page did not
+  load. Record this -- it is a negative result for the census.</div></noscript>
+<script>
+/* BarbarismJB webkit-rig capsweep page: one-shot capability census.
+ *
+ * Detects and reports every API on the confirmed/dead surface lists
+ * (docs/WEBKIT-ANALYSIS.md): confirmed fetch/XHR/WebSocket/Workers/
+ * Canvas+readback/localStorage/Gamepad/BigInt/structuredClone; dead HTTPS
+ * only via this plain-HTTP origin, WebGL, WebAssembly, indexedDB, video,
+ * file APIs. Plus UA/viewport/language/timezone, a localStorage quota
+ * probe, a WS connect-back to the rig origin, a Worker spawn + roundtrip,
+ * a Canvas 2D readback with pixel hash, a FontFace remote-load probe
+ * (missing /stage file: the fetch landing in the access log is the
+ * signal), performance.now resolution, structuredClone/Proxy/
+ * FinalizationRegistry presence, error-event capture, and a ~20-kernel
+ * primitive-loop timing fingerprint for C_LOOP identification (raw
+ * samples only; the bench does the analysis).
+ *
+ * Every probe is wrapped; one failure must never kill the sweep. Phase
+ * "env" POSTs immediately (crash insurance), phase "full" is the one
+ * JSON request at the end, retried with backoff.
+ *
+ * ES5-only like the other rig pages (no arrows, let/const, template
+ * literals). The server templates {{RIG_HOST}}/{{RIG_PORT}}; unfilled
+ * tokens (file opened directly) fall back to location.host.
+ */
+
+var RIG_SCHEMA = 1;
+var RIG_PAGE = "capsweep";
+var RIG_HOST = "{{RIG_HOST}}";
+var RIG_PORT = "{{RIG_PORT}}";
+var RIG_FILLED = RIG_HOST.indexOf("{{") !== 0;
+var RIG_BASE = RIG_FILLED
+    ? "http://" + RIG_HOST + ":" + RIG_PORT
+    : (location.protocol + "//" + location.host);
+
+var R = {
+  schema: RIG_SCHEMA,
+  page: RIG_PAGE,
+  phase: "boot",
+  seq: 0,
+  startedAt: (new Date()).toISOString(),
+  stage: "boot",
+  rig: { templated: RIG_FILLED ? (RIG_HOST + ":" + RIG_PORT) : null,
+         base: RIG_BASE, pageHost: location.host },
+  location: { url: location.href, referrer: document.referrer || null,
+              protocol: location.protocol },
+  env: {}, features: {}, syntax: {}, storage: null, ws: null, worker: null,
+  canvas: null, fontface: null, timer: null, cloop: null,
+  posts: {}, errors: []
+};
+
+/* error-event capture first, so a crash inside any later probe is
+ * recorded in R.errors and survives in the final POST */
+function installErrorCapture() {
+  try {
+    window.onerror = function (msg, src, line, col) {
+      if (R.errors.length < 40) {
+        R.errors.push({ stage: "window.onerror", error: String(msg),
+                        src: String(src), line: line, col: col });
+      }
+      return false;
+    };
+  } catch (e) {}
+  try {
+    window.addEventListener("unhandledrejection", function (ev) {
+      if (R.errors.length < 40) {
+        var r = ev && ev.reason;
+        R.errors.push({ stage: "unhandledrejection",
+                        error: String(r && r.message ? r.message : r) });
+      }
+    });
+  } catch (e) {}
+}
+
+function fail(stage, e) {
+  if (R.errors.length < 40) {
+    R.errors.push({ stage: stage, error: String(e && e.message ? e.message : e) });
+  }
+}
+function $(id) { return document.getElementById(id); }
+function setRow(id, text) { try { $(id).textContent = String(text); } catch (e) {} }
+function setState(text, cls) {
+  try { var el = $("rig-state"); el.textContent = text;
+        el.className = cls || ""; } catch (e) {}
+}
+function nowMs() {
+  try {
+    if (typeof performance !== "undefined" && performance &&
+        typeof performance.now === "function") {
+      return performance.now();
+    }
+  } catch (e) {}
+  return Date.now();
+}
+function timerName() {
+  return (typeof performance !== "undefined" && performance &&
+          typeof performance.now === "function")
+      ? "performance.now" : "Date.now";
+}
+/* one guarded probe: fn() runs inside try/catch; its throw is recorded,
+ * never propagated -- the sweep must always finish and always POST */
+function probe(stage, fn) {
+  try { return fn(); } catch (e) { fail(stage, e); return null; }
+}
+
+/* ------------------------------------------------------- transport */
+/* Same sendJson/viaXhr/backoff trio as the schema-1 pages. */
+function sendJson(url, obj, cb) {
+  var payload;
+  try { payload = JSON.stringify(obj); }
+  catch (e) { fail("post.stringify", e); cb(false); return; }
+  if (typeof fetch === "function") {
+    fetch(url, { method: "POST",
+                 headers: { "Content-Type": "application/json" },
+                 body: payload })
+      .then(function (res) { cb(!!res && res.ok); })
+      .catch(function () { viaXhr(url, payload, cb); });
+    return;
+  }
+  viaXhr(url, payload, cb);
+}
+function viaXhr(url, payload, cb) {
+  if (typeof XMLHttpRequest === "undefined") { cb(false, "no transport"); return; }
+  var done = false;
+  function finish(ok, why) {
+    if (!done) { done = true; cb(ok, why); }
+  }
+  try {
+    var xhr = new XMLHttpRequest();
+    xhr.open("POST", url, true);
+    xhr.timeout = 5000;
+    xhr.setRequestHeader("Content-Type", "application/json");
+    xhr.onreadystatechange = function () {
+      if (xhr.readyState === 4) {
+        finish(xhr.status >= 200 && xhr.status < 300);
+      }
+    };
+    xhr.onerror = function () { finish(false, "xhr.onerror"); };
+    xhr.ontimeout = function () { finish(false, "xhr.ontimeout"); };
+    xhr.send(payload);
+  } catch (e) { fail("post.xhr", e); finish(false, "xhr.threw"); }
+}
+var BACKOFF_MS = [250, 500, 1000, 2000, 4000, 8000];
+function postReport(phase, cb) {
+  var attempts = 0;
+  function attempt() {
+    attempts++;
+    R.phase = phase;
+    R.seq++;
+    R.posts[phase] = { attempts: attempts, at: (new Date()).toISOString() };
+    sendJson(RIG_BASE + "/report", R, function (ok, why) {
+      if (ok) { cb(true, attempts); return; }
+      if (attempts <= BACKOFF_MS.length) {
+        setRow("rig-post", "retry " + attempts + " in " + BACKOFF_MS[attempts - 1] + "ms");
+        setTimeout(attempt, BACKOFF_MS[attempts - 1]);
+      } else {
+        R.posts[phase].lastError = why || "unknown";
+        cb(false, attempts);
+      }
+    });
+  }
+  attempt();
+}
+
+/* ------------------------------------------------------ environment */
+function probeEnv() {
+  var e = {};
+  probe("env.ua", function () {
+    e.userAgent = navigator.userAgent;
+    e.appVersion = navigator.appVersion || null;
+    e.platform = navigator.platform || null;
+  });
+  probe("env.lang", function () {
+    e.language = navigator.language || null;
+    try { e.languages = (navigator.languages || []).join(",") || null; } catch (x) {}
+  });
+  probe("env.misc", function () {
+    e.cookieEnabled = !!navigator.cookieEnabled;
+    e.onLine = (typeof navigator.onLine === "boolean") ? navigator.onLine : null;
+    e.hardwareConcurrency = (typeof navigator.hardwareConcurrency === "number")
+        ? navigator.hardwareConcurrency : null;
+    e.deviceMemory = (typeof navigator.deviceMemory === "number")
+        ? navigator.deviceMemory : null;
+    e.maxTouchPoints = (typeof navigator.maxTouchPoints === "number")
+        ? navigator.maxTouchPoints : null;
+  });
+  probe("env.viewport", function () {
+    e.viewport = { innerW: window.innerWidth, innerH: window.innerHeight,
+                   outerW: window.outerWidth, outerH: window.outerHeight,
+                   dpr: window.devicePixelRatio || null };
+    e.screen = { w: screen.width, h: screen.height,
+                 availW: screen.availWidth, availH: screen.availHeight,
+                 colorDepth: screen.colorDepth || null };
+    if (window.visualViewport) {
+      e.visualViewport = { w: window.visualViewport.width,
+                           h: window.visualViewport.height,
+                           scale: window.visualViewport.scale };
+    }
+  });
+  probe("env.tz", function () {
+    e.timezoneOffsetMin = new Date().getTimezoneOffset();
+    try {
+      e.timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || null;
+    } catch (x) { e.timezone = null; }
+  });
+  probe("env.gamepad", function () {
+    e.gamepad = { api: typeof navigator.getGamepads,
+                  Gamepad: typeof Gamepad };
+    if (typeof navigator.getGamepads === "function") {
+      var pads = navigator.getGamepads() || [];
+      var live = [], i;
+      for (i = 0; i < pads.length; i++) {
+        if (pads[i]) { live.push(pads[i].id); }
+      }
+      e.gamepad.slots = pads.length;
+      e.gamepad.live = live;
+    }
+  });
+  R.env = e;
+  return e;
+}
+
+/* -------------------------------------------------------- features */
+/* typeof-matrix over the confirmed/dead lists + fork markers. "function"
+ * / "object" / "undefined" verbatim: the bench diffs the whole map. */
+function probeFeatures() {
+  var f = {};
+  var names = [
+    /* confirmed surface */
+    "fetch", "XMLHttpRequest", "WebSocket", "Worker", "BigInt",
+    "structuredClone", "localStorage", "sessionStorage",
+    /* canvas family */
+    "HTMLCanvasElement", "CanvasRenderingContext2D", "ImageData",
+    "OffscreenCanvas",
+    /* dead list */
+    "WebGLRenderingContext", "WebGL2RenderingContext", "WebAssembly",
+    "indexedDB", "File", "Blob", "FileReader", "Filesystem",
+    /* engine-version markers (2.39-window fork, WEBKIT-ANALYSIS 2.2) */
+    "Proxy", "Reflect", "FinalizationRegistry", "WeakRef", "WeakMap",
+    "SharedArrayBuffer", "Atomics", "Temporal", "ShadowRealm",
+    "queueMicrotask", "requestIdleCallback", "TextEncoder", "TextDecoder",
+    "Notification", "ServiceWorker", "SharedWorker", "EventSource",
+    "RTCPeerConnection", "AudioContext", "MutationObserver",
+    "IntersectionObserver", "ResizeObserver", "AbortController",
+    "URLSearchParams", "crypto", "SubtleCrypto"
+  ];
+  var i, n;
+  for (i = 0; i < names.length; i++) {
+    n = names[i];
+    probe("feat." + n, (function (nm) {
+      return function () {
+        var v;
+        try { v = eval("typeof " + nm + ";"); } catch (x) { v = "eval-threw"; }
+        f[nm] = v;
+      };
+    })(n));
+  }
+  probe("feat.document.fonts", function () {
+    f["document.fonts"] = (document.fonts &&
+                           typeof document.fonts.size === "number")
+        ? "FontFaceSet" : (document.fonts ? "object" : "undefined");
+  });
+  probe("feat.gamepads", function () {
+    f["navigator.getGamepads"] = typeof navigator.getGamepads;
+  });
+  probe("feat.getContext2d", function () {
+    var c = document.createElement("canvas");
+    f["canvas.getContext('2d')"] = !!c.getContext("2d");
+    f["canvas.getContext('webgl')"] = !!c.getContext("webgl");
+    f["canvas.toDataURL"] = typeof c.toDataURL;
+  });
+  probe("feat.video", function () {
+    var v = document.createElement("video");
+    f["video.canPlayType"] = typeof v.canPlayType;
+    if (typeof v.canPlayType === "function") {
+      f["video.h264"] = v.canPlayType('video/mp4; codecs="avc1.42E01E"');
+      f["video.vp9"] = v.canPlayType('video/vp9');
+    }
+  });
+  R.features = f;
+  return f;
+}
+function countByValue(f) {
+  var supported = [], k;
+  for (k in f) {
+    if (f[k] && f[k] !== "undefined" && f[k] !== false &&
+        f[k] !== "eval-threw" && f[k] !== "") {
+      supported.push(k);
+    }
+  }
+  return supported;
+}
+
+/* --------------------------------------------------------- syntax */
+function probeSyntax() {
+  var s = {};
+  var cases = {
+    "arrow": "var f = function (x) { return x; }; f(1);",
+    "let-const": "let a = 1; const b = 2; a + b;",
+    "class": "class C { m() { return 1; } } new C().m();",
+    "template-literal": "var t = `a${1}b`; t;",
+    "async-await": "(async function () { await 1; });",
+    "optional-chaining": "var o = null; o && o.a;",
+    "nullish": "var z = null; z || 0;",
+    "bigint-literal": "var big = 123456789012345678901234567890n;",
+    "spread": "Math.max.apply(null, [1, 2, 3]);",
+    "regex-lookbehind": "var re = /(?<=a)b/;",
+    "numeric-separator": "var ns = 1_000_000;"
+  };
+  var k;
+  for (k in cases) {
+    s[k] = probe("syntax." + k, (function (src) {
+      return function () {
+        try { new Function(src); return true; } catch (e) { return false; }
+      };
+    })(cases[k]));
+  }
+  R.syntax = s;
+  return s;
+}
+
+/* --------------------------------------------------- localStorage */
+function probeStorage() {
+  var out = { available: false };
+  probe("storage.basic", function () {
+    if (typeof localStorage === "undefined" || !localStorage) {
+      out.available = false;
+      out.reason = "localStorage undefined";
+      return;
+    }
+    out.available = true;
+    var k = "capsweep-basic";
+    localStorage.setItem(k, "v1");
+    out.roundtrip = localStorage.getItem(k) === "v1";
+    out.removable = (localStorage.removeItem(k), localStorage.getItem(k) === null);
+    out.preexistingKeys = [];
+    for (var i = 0; i < localStorage.length; i++) {
+      out.preexistingKeys.push(localStorage.key(i));
+    }
+  });
+  if (!out.available) { R.storage = out; return out; }
+  /* quota: grow a single value until setItem throws or the cap hits */
+  probe("storage.quota", function () {
+    var k = "capsweep-quota", unit = "", written = 0;
+    var chunk = (function () {
+      var s = "", i;
+      for (i = 0; i < 1024; i++) { s += "q"; }
+      return s;
+    })();
+    var capBytes = 2 * 1024 * 1024;   /* 2 MiB is plenty of signal */
+    var t0 = nowMs(), err = null, kb;
+    try {
+      for (kb = 0; kb * 1024 <= capBytes; kb += 32) {
+        unit += (function () {
+          var s = "", j;
+          for (j = 0; j < 32; j++) { s += chunk; }
+          return s;
+        })();
+        localStorage.setItem(k, unit);
+        written = unit.length;
+      }
+    } catch (e) {
+      err = { name: e && e.name, message: String(e && e.message ? e.message : e) };
+    }
+    try { localStorage.removeItem(k); } catch (e2) {}
+    out.quota = { bytesWritten: written, kib: Math.round(written / 1024),
+                  cappedAt: capBytes, error: err,
+                  ms: Math.round((nowMs() - t0) * 100) / 100 };
+  });
+  R.storage = out;
+  return out;
+}
+
+/* -------------------------------------------- websocket connect-back */
+function probeWebSocket(cb) {
+  var out = { transport: typeof WebSocket, attempted: false };
+  if (typeof WebSocket !== "function") {
+    out.verdict = "unsupported";
+    R.ws = out; cb(out); return;
+  }
+  probe("ws.connect", function () {
+    out.attempted = true;
+    var url = RIG_BASE.replace(/^http/, "ws") + "/ws?role=probe";
+    out.url = url;
+    var t0 = nowMs(), settled = false, toTimer = null;
+    var done = function (verdict, extra) {
+      if (settled) { return; }
+      settled = true;
+      if (toTimer) { clearTimeout(toTimer); toTimer = null; }
+      out.verdict = verdict;
+      out.totalMs = Math.round((nowMs() - t0) * 100) / 100;
+      if (extra) { for (var k in extra) { out[k] = extra[k]; } }
+      R.ws = out;
+      cb(out);
+    };
+    var sock;
+    try { sock = new WebSocket(url); }
+    catch (e) { done("constructor-threw", { error: String(e) }); return; }
+    out.opened = false;
+    sock.onopen = function () {
+      out.opened = true;
+      out.openMs = Math.round((nowMs() - t0) * 100) / 100;
+    };
+    sock.onmessage = function (ev) {
+      out.serverMessage = String(ev.data);
+      out.gotWelcome = out.serverMessage.indexOf("welcome") !== -1;
+      try { sock.close(1000, "capsweep done"); } catch (e) {}
+    };
+    sock.onclose = function (ev) {
+      done(out.opened ? (out.gotWelcome ? "open+welcome+close"
+                                        : "open+close-no-welcome")
+                      : "closed-before-open",
+           { code: ev && ev.code, reason: ev && ev.reason,
+             clean: !!(ev && ev.wasClean) });
+    };
+    sock.onerror = function () {
+      if (!out.opened) { done("error-before-open", { code: null }); }
+    };
+    toTimer = setTimeout(function () { done("timeout", { opened: out.opened }); }, 6000);
+  });
+  if (!out.attempted) { R.ws = out; cb(out); }
+}
+
+/* --------------------------------------------------------- worker */
+function probeWorker(cb) {
+  var out = { transport: typeof Worker, attempted: false };
+  if (typeof Worker !== "function") {
+    out.verdict = "unsupported";
+    R.worker = out; cb(out); return;
+  }
+  probe("worker.spawn", function () {
+    out.attempted = true;
+    out.blobURLSupport = (typeof Blob === "function" &&
+                          typeof URL !== "undefined" &&
+                          typeof URL.createObjectURL === "function");
+    if (!out.blobURLSupport) {
+      out.verdict = "no-blob-url";
+      R.worker = out; cb(out); return;
+    }
+    var src = "self.onmessage=function(e){postMessage({echo:e.data," +
+              "ua:(self.navigator&&self.navigator.userAgent)||null})};";
+    var url = URL.createObjectURL(new Blob([src], { type: "text/javascript" }));
+    var t0 = nowMs(), settled = false, toTimer = null;
+    var done = function (verdict, extra) {
+      if (settled) { return; }
+      settled = true;
+      if (toTimer) { clearTimeout(toTimer); toTimer = null; }
+      out.verdict = verdict;
+      out.totalMs = Math.round((nowMs() - t0) * 100) / 100;
+      if (extra) { for (var k in extra) { out[k] = extra[k]; } }
+      try { URL.revokeObjectURL(url); } catch (e) {}
+      R.worker = out;
+      cb(out);
+    };
+    var w;
+    try { w = new Worker(url); }
+    catch (e) { done("constructor-threw", { error: String(e) }); return; }
+    w.onmessage = function (ev) {
+      out.roundtrip = true;
+      out.echo = ev.data && ev.data.echo;
+      out.workerUA = ev.data && ev.data.ua;
+      try { w.terminate(); } catch (e) {}
+      done("spawned+roundtrip");
+    };
+    w.onerror = function (ev) {
+      done("worker-onerror", { errorText: ev && ev.message });
+      try { w.terminate(); } catch (e) {}
+    };
+    try { w.postMessage("ping"); }
+    catch (e) { done("postMessage-threw", { error: String(e) }); }
+    toTimer = setTimeout(function () { done("timeout"); }, 6000);
+  });
+  if (!out.attempted) { R.worker = out; cb(out); }
+}
+
+/* --------------------------------------------------------- canvas */
+function fnv1a(bytes) {
+  var h = 0x811c9dc5, i;
+  for (i = 0; i < bytes.length; i++) {
+    h ^= bytes[i];
+    h = (h + ((h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24))) >>> 0;
+  }
+  return h >>> 0;
+}
+function probeCanvas() {
+  var out = {};
+  probe("canvas.roundtrip", function () {
+    var c = document.createElement("canvas");
+    c.width = 64; c.height = 32;
+    var ctx = c.getContext("2d");
+    if (!ctx) { out.verdict = "no-2d-context"; return; }
+    var t0 = nowMs();
+    /* deterministic pattern: gradient + rects + text */
+    var grad = ctx.createLinearGradient(0, 0, 64, 32);
+    grad.addColorStop(0, "#123456");
+    grad.addColorStop(1, "#fedcba");
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, 64, 32);
+    ctx.fillStyle = "#0f0";
+    ctx.fillRect(8, 8, 12, 9);
+    ctx.strokeStyle = "#f0f";
+    ctx.lineWidth = 2;
+    ctx.strokeRect(20, 4, 30, 24);
+    ctx.fillStyle = "#fff";
+    ctx.font = "10px sans-serif";
+    ctx.fillText("capsweep", 2, 28);
+    var drawMs = nowMs() - t0;
+    var t1 = nowMs();
+    var img = ctx.getImageData(0, 0, 64, 32);
+    var readbackMs = nowMs() - t1;
+    var hash = fnv1a(img.data);
+    var t2 = nowMs();
+    var dataUrl = c.toDataURL("image/png");
+    var encodeMs = nowMs() - t2;
+    /* roundtrip: put it back and re-read; hash must match */
+    var c2 = document.createElement("canvas");
+    c2.width = 64; c2.height = 32;
+    c2.getContext("2d").putImageData(img, 0, 0);
+    var rehash = fnv1a(c2.getContext("2d").getImageData(0, 0, 64, 32).data);
+    out = {
+      verdict: "ok",
+      w: c.width, h: c.height,
+      pixelHash: ("00000000" + hash.toString(16)).slice(-8),
+      pixelHashReRead: ("00000000" + rehash.toString(16)).slice(-8),
+      roundtripStable: hash === rehash,
+      dataUrlPrefix: dataUrl.slice(0, 22),
+      dataUrlLength: dataUrl.length,
+      timingsMs: {
+        draw: Math.round(drawMs * 100) / 100,
+        readback: Math.round(readbackMs * 100) / 100,
+        encode: Math.round(encodeMs * 100) / 100
+      }
+    };
+  });
+  R.canvas = out;
+  return out;
+}
+
+/* ------------------------------------------------------- fontface */
+function probeFontFace(cb) {
+  var out = { FontFace: typeof FontFace,
+              fontFaceSet: R.features["document.fonts"] || null };
+  if (typeof FontFace !== "function") {
+    out.verdict = "unsupported";
+    R.fontface = out; cb(out); return;
+  }
+  var pending = 2, t0 = nowMs();
+  var finish = function () {
+    if (--pending > 0) { return; }
+    out.verdict = (out.remoteStatus || out.localStatus) ? "probed" : "no-settle";
+    out.totalMs = Math.round((nowMs() - t0) * 100) / 100;
+    R.fontface = out;
+    cb(out);
+  };
+  /* settle-one: run body guarded; a throw still settles this branch so the
+   * driver can never stall waiting on a dead promise */
+  function branch(stage, body) {
+    var ok = false;
+    try { body(); ok = true; } catch (e) { fail(stage, e); }
+    if (!ok) { finish(); }
+  }
+  /* remote: /stage file intentionally missing; the 404 in the bench access
+   * log is the evidence that the applet fetched a remote font URL */
+  branch("fontface.remote", function () {
+    var tr = nowMs();
+    var face = new FontFace("capsweepremote",
+                            "url(" + RIG_BASE + "/stage/capsweep-remotefont.woff2)");
+    face.load().then(function (f) {
+      out.remoteStatus = f.status;
+      out.remoteMs = Math.round((nowMs() - tr) * 100) / 100;
+      finish();
+    }, function (e) {
+      out.remoteStatus = face.status;
+      out.remoteError = String(e && e.message ? e.message : e).slice(0, 160);
+      out.remoteMs = Math.round((nowMs() - tr) * 100) / 100;
+      finish();
+    });
+  });
+  /* local(): the synchronously-resolvable path the fontchain trigger needs */
+  branch("fontface.local", function () {
+    var tl = nowMs();
+    var lf = new FontFace("capsweeplocal", "local(Helvetica)");
+    lf.load().then(function (f) {
+      out.localStatus = f.status;
+      out.localMs = Math.round((nowMs() - tl) * 100) / 100;
+      finish();
+    }, function (e) {
+      out.localStatus = lf.status;
+      out.localError = String(e && e.message ? e.message : e).slice(0, 160);
+      out.localMs = Math.round((nowMs() - tl) * 100) / 100;
+      finish();
+    });
+  });
+}
+
+/* ------------------------------------------- performance.now resolution */
+function probeTimerResolution() {
+  var out = { timer: timerName() };
+  probe("timer.resolution", function () {
+    /* adaptive: coarse-clamped timers (0.1ms+) need many iterations before
+     * a delta shows; keep sampling until we have changes or hit the cap */
+    var MAX_ITERS = 100000, WANT_CHANGES = 200;
+    var deltas = [], i, prev = nowMs(), cur;
+    for (i = 0; i < MAX_ITERS && deltas.length < WANT_CHANGES; i++) {
+      cur = nowMs();
+      if (cur !== prev) { deltas.push(cur - prev); }
+      prev = cur;
+    }
+    var N = i;
+    var minPos = null, max = 0, hist = {}, k;
+    for (i = 0; i < deltas.length; i++) {
+      var d = deltas[i];
+      if (d > 0 && (minPos === null || d < minPos)) { minPos = d; }
+      if (d > max) { max = d; }
+      var bucket = Math.round(d * 100) / 100;   /* 10us buckets */
+      hist[bucket] = (hist[bucket] || 0) + 1;
+    }
+    var distinct = [];
+    for (k in hist) { distinct.push(k); }
+    distinct.sort(function (a, b) { return a - b; });
+    out = {
+      timer: out.timer,
+      samples: N, changes: deltas.length,
+      minPositiveDeltaMs: minPos === null ? null
+          : Math.round(minPos * 10000) / 10000,
+      maxDeltaMs: Math.round(max * 10000) / 10000,
+      distinctDeltaCount: distinct.length,
+      topDeltas: distinct.slice(0, 8),
+      histogram: (function () {
+        var h = {}, idx;
+        for (idx = 0; idx < distinct.length && idx < 12; idx++) {
+          h[distinct[idx]] = hist[distinct[idx]];
+        }
+        return h;
+      })()
+    };
+  });
+  R.timer = out;
+  return out;
+}
+
+/* ------------------------------------------- C_LOOP timing fingerprint */
+/* ~20 primitive-loop kernels, 3 timed samples each, raw samples recorded.
+ * Interpreter-only engines (JSC C_LOOP, JIT disabled) show distinctive
+ * ratios vs JIT'd engines; the BENCH does the analysis, this only
+ * measures. Iteration counts tuned so one sample is a few ms on the
+ * interpreter. */
+function probeCloop() {
+  var K = [
+    { name: "int-add", iters: 400000,
+      fn: function (s, i) { return (s + i) | 0; } },
+    { name: "float-mul", iters: 400000,
+      fn: function (s, i) { return s * 1.0000001 + 0.5; } },
+    { name: "bit-ops", iters: 400000,
+      fn: function (s, i) { return ((s ^ i) << 3) | 1; } },
+    { name: "prop-rw", iters: 200000,
+      pre: function () { return { a: 1, b: 2 }; },
+      fn: function (o, s, i) { o.a = o.b; o.b = (o.a ^ i) & 255; return o.b; } },
+    { name: "array-idx", iters: 400000,
+      pre: function () { var a = [], i; for (i = 0; i < 1024; i++) { a.push(i); } return a; },
+      fn: function (a, s, i) { return a[i & 1023]; } },
+    { name: "typed-arr", iters: 400000,
+      pre: function () { return new Uint8Array(1024); },
+      fn: function (u, s, i) { u[i & 1023] = i & 255; return u[i & 1023]; } },
+    { name: "str-build16", iters: 100000,
+      fn: function (s, i) { var t = "a"; t += "bcdefgh"; t += "ijklmn"; t += i & 15; return t.length; } },
+    { name: "char-code", iters: 400000,
+      pre: function () { return "capsweep-probe-string"; },
+      fn: function (str, s, i) { return str.charCodeAt(i & 19); } },
+    { name: "closure-call", iters: 200000,
+      pre: function () { return function (x) { return x + 1; }; },
+      fn: function (f, s, i) { return f(i); } },
+    { name: "apply-variadic", iters: 100000,
+      pre: function () { function sum() { var t = 0, j; for (j = 0; j < arguments.length; j++) { t += arguments[j]; } return t; } return sum; },
+      fn: function (f, s, i) { return f(i, i + 1, i + 2, i + 3); } },
+    { name: "getter", iters: 200000,
+      pre: function () { var o = {}; Object.defineProperty(o, "x", { get: function () { return 1; } }); return o; },
+      fn: function (o, s, i) { return o.x + i; } },
+    { name: "for-in", iters: 100000,
+      pre: function () { return { a: 1, b: 2, c: 3, d: 4 }; },
+      fn: function (o, s, i) { var t = 0, k; for (k in o) { t += o[k]; } return t; } },
+    { name: "regex-exec", iters: 100000,
+      pre: function () { return /caps[wx]eeep?-pro(be|bing)/; },
+      fn: function (re, s, i) { return re.exec("capsweep-probing-" + (i & 7)) ? 1 : 0; } },
+    { name: "json-parse", iters: 50000,
+      fn: function (s, i) { return JSON.parse('{"a":' + (i & 7) + ',"b":[1,2,3]}').a; } },
+    { name: "json-stringify", iters: 50000,
+      pre: function () { return { a: 1, b: "x", c: [1, 2, 3] }; },
+      fn: function (o, s, i) { return JSON.stringify(o).length; } },
+    { name: "math-sincos", iters: 200000,
+      fn: function (s, i) { return Math.sin(i) * Math.cos(i); } },
+    { name: "date-obj", iters: 50000,
+      fn: function (s, i) { return new Date(2026, 0, (i & 11) + 1, 12).getTime(); } },
+    { name: "throw-catch", iters: 100000,
+      fn: function (s, i) { try { throw i; } catch (e) { return e; } } },
+    { name: "fib10-rec", iters: 20000,
+      fn: function (s, i) {
+        function fib(n) { return n < 2 ? n : fib(n - 1) + fib(n - 2); }
+        return fib(10);
+      } },
+    { name: "typeof-chain", iters: 400000,
+      fn: function (s, i) { return typeof i === "number" ? 1 : 0; } }
+  ];
+  var SAMPLES = 3, results = [], t_all = nowMs();
+  var i, k, r, state, acc, j, t0;
+  for (i = 0; i < K.length; i++) {
+    k = K[i];
+    r = { name: k.name, iters: k.iters, samples: [] };
+    probe("cloop." + k.name, function () {
+      state = k.pre ? k.pre() : null;
+      for (j = 0; j < SAMPLES; j++) {
+        acc = 0;
+        t0 = nowMs();
+        if (state !== null && state !== undefined) {
+          for (var n = 0; n < k.iters; n++) { acc += k.fn(state, acc, n); }
+        } else {
+          for (var m = 0; m < k.iters; m++) { acc += k.fn(acc, m); }
+        }
+        r.samples.push(Math.round((nowMs() - t0) * 1000) / 1000);
+      }
+      r.checksum = acc;
+    });
+    if (!r.samples.length) { r.error = "probe-threw"; }
+    results.push(r);
+    if (nowMs() - t_all > 8000) {
+      results.push({ name: "(remaining kernels skipped)", reason: "budget" });
+      break;
+    }
+  }
+  R.cloop = { timer: timerName(), samples: SAMPLES,
+              totalMs: Math.round((nowMs() - t_all) * 100) / 100,
+              kernels: results };
+  return R.cloop;
+}
+
+/* ------------------------------------------------ structuredClone etc */
+function probeMiscPresence() {
+  probe("misc.structuredClone", function () {
+    if (typeof structuredClone !== "function") { return; }
+    var src = { a: 1, b: "x", c: [1, 2], d: { e: new Date(0) } };
+    var cp = structuredClone(src);
+    R.features["structuredClone.roundtrip"] =
+        cp && cp.a === 1 && cp.d && cp.d.e instanceof Date;
+    src.a = 99;
+    R.features["structuredClone.deep"] = cp.a === 1;
+  });
+  probe("misc.Proxy", function () {
+    if (typeof Proxy !== "function") { return; }
+    var hit = 0;
+    var p = new Proxy({}, { get: function () { hit++; return 7; } });
+    R.features["Proxy.trap"] = (p.z === 7 && hit === 1);
+    var r = Proxy.revocable({}, {});
+    r.revoke();
+    var threw = false;
+    try { r.proxy.x; } catch (e) { threw = true; }
+    R.features["Proxy.revocable"] = threw;
+  });
+  probe("misc.FinalizationRegistry", function () {
+    if (typeof FinalizationRegistry !== "function") { return; }
+    var reg = null, held = null;
+    reg = new FinalizationRegistry(function (v) { held = v; });
+    /* do not wait for GC; registration not throwing is the signal */
+    (function () { var t = { m: 1 }; reg.register(t, "gone"); t = null; })();
+    R.features["FinalizationRegistry.register"] = true;
+  });
+  probe("misc.BigInt", function () {
+    if (typeof BigInt !== "function") { return; }
+    var b = BigInt("123456789012345678901234567890");
+    R.features["BigInt.add"] = (b + b === BigInt("246913578024691357802469135780"));
+    R.features["BigInt.asUintN"] =
+        (BigInt.asUintN(64, b) === BigInt("123456789012345678901234567890") % (BigInt(1) << BigInt(64)) ||
+         typeof BigInt.asUintN === "function");
+  });
+}
+
+/* ------------------------------------------------------------ driver */
+function summarize(f) {
+  var sup = countByValue(f), dead = [];
+  var deadList = ["WebGLRenderingContext", "WebGL2RenderingContext",
+                  "WebAssembly", "indexedDB", "FileReader", "Filesystem"];
+  var i;
+  for (i = 0; i < deadList.length; i++) {
+    if (f[deadList[i]] === "undefined") { dead.push(deadList[i]); }
+  }
+  return sup.length + " present, " + dead.length + " of dead-list absent";
+}
+
+function run() {
+  setRow("rig-url", location.href);
+  R.env = probeEnv();
+  setRow("rig-ua", R.env.userAgent || "(no navigator.userAgent)");
+  setRow("rig-env", (R.env.viewport ? R.env.viewport.innerW + "x" +
+      R.env.viewport.innerH + " dpr=" + R.env.viewport.dpr : "?") +
+      " tz=" + (R.env.timezone || R.env.timezoneOffsetMin + "m"));
+
+  /* phase env: identity out immediately (crash insurance) */
+  R.features = probeFeatures();
+  R.syntax = probeSyntax();
+  setRow("rig-feat", summarize(R.features));
+  postReport("env", function (ok, attempts) {
+    setRow("rig-post", ok ? "sent (env, " + attempts + " attempt(s))"
+                          : "env POST failed after " + attempts);
+  });
+
+  /* async probes, then the sync tail, then the single full POST. Each step
+   * carries a watchdog: a probe that dies without calling back (or an
+   * on-device API that never settles) must never stall the sweep -- the
+   * full POST at the end is the point of the page. */
+  var steps = [];
+  var STEP_BUDGET_MS = 15000;
+  var watchdog = null;
+  var next = function () {
+    if (watchdog) { clearTimeout(watchdog); watchdog = null; }
+    if (!steps.length) { return finish(); }
+    var s = steps.shift();
+    watchdog = setTimeout(function () {
+      fail("driver.watchdog", s.name || "step");
+      next();
+    }, STEP_BUDGET_MS);
+    try { s.fn(); } catch (e) { fail("driver.step", e); next(); }
+  };
+  var step = function (name, fn) { steps.push({ name: name, fn: fn }); };
+
+  step("storage", function () {
+    R.stage = "storage";
+    var st = probeStorage();
+    setRow("rig-ls", st.available
+        ? ("ok; quota " + (st.quota ? st.quota.kib + "KiB" : "?") +
+           (st.quota && st.quota.error ? " (" + st.quota.error.name + ")" : ""))
+        : "unavailable");
+    next();
+  });
+  step("websocket", function () {
+    R.stage = "ws";
+    setRow("rig-ws", "connecting&hellip;");
+    probeWebSocket(function (w) {
+      setRow("rig-ws", w.verdict + (w.openMs != null ? " open@" + w.openMs + "ms" : ""));
+      next();
+    });
+  });
+  step("worker", function () {
+    R.stage = "worker";
+    setRow("rig-worker", "spawning&hellip;");
+    probeWorker(function (wk) {
+      setRow("rig-worker", wk.verdict +
+             (wk.workerUA ? " (worker UA: " + wk.workerUA.slice(0, 40) + "…)" : ""));
+      next();
+    });
+  });
+  step("canvas", function () {
+    R.stage = "canvas";
+    var c = probeCanvas();
+    setRow("rig-canvas", c.verdict === "ok"
+        ? ("hash=" + c.pixelHash + " stable=" + c.roundtripStable +
+           " readback=" + c.timingsMs.readback + "ms")
+        : (c.verdict || "failed"));
+    next();
+  });
+  step("fontface", function () {
+    R.stage = "fontface";
+    setRow("rig-font", "loading&hellip;");
+    probeFontFace(function (ff) {
+      setRow("rig-font", "remote=" + (ff.remoteStatus || "?") +
+             " local=" + (ff.localStatus || "?"));
+      next();
+    });
+  });
+  step("timer", function () {
+    R.stage = "timer";
+    var t = probeTimerResolution();
+    setRow("rig-timer", t.minPositiveDeltaMs != null
+        ? ("min delta " + t.minPositiveDeltaMs + "ms, " +
+           t.distinctDeltaCount + " distinct (" + t.timer + ")")
+        : "no delta measured");
+    next();
+  });
+  step("misc", function () {
+    R.stage = "misc";
+    probeMiscPresence();
+    next();
+  });
+  step("cloop", function () {
+    R.stage = "cloop";
+    setRow("rig-cloop", "measuring&hellip;");
+    var cl = probeCloop();
+    var ok = 0, i;
+    for (i = 0; i < cl.kernels.length; i++) {
+      if (cl.kernels[i].samples && cl.kernels[i].samples.length) { ok++; }
+    }
+    setRow("rig-cloop", ok + "/" + cl.kernels.length + " kernels, " +
+           cl.totalMs + "ms (" + cl.timer + ")");
+    next();
+  });
+
+  function finish() {
+    R.stage = "done";
+    setState("POSTING", "");
+    postReport("full", function (ok, attempts) {
+      if (ok) {
+        setRow("rig-post", "sent (full, " + attempts + " attempt(s))");
+        setState("DONE", "done");
+      } else {
+        setRow("rig-post", "FAILED after " + attempts + " attempts");
+        setState("SEND FAILED", "failed");
+      }
+    });
+  }
+
+  next();
+}
+
+installErrorCapture();
+try {
+  run();
+} catch (e) {
+  /* last-ditch: the env-phase line may already be on the bench */
+  fail("driver", e);
+  R.stage = "CRASHED@" + (R.stage || "driver");
+  setState("SWEEP CRASHED", "failed");
+  try { postReport("crash", function () {}); } catch (e2) {}
+}
+</script>
+</body>
+</html>

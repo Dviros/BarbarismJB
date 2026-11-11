@@ -1,0 +1,40 @@
+# BarbarismJB — License Statement
+
+**© 2026 Dvir Sasson (dviros). All rights reserved.**
+
+## What this is
+
+BarbarismJB is a security-research workbench for the Nintendo Switch 2,
+published **source-available for research on hardware you own**. It is
+derived work: the jailbreak engine is a port of the public ns2jb research
+(kurumuz et al.), the entry research builds on CivSwitch (Gezine), and the
+network rig reproduces techniques documented by the public captive-portal
+research benches. See `PROVENANCE.md` for the full derivation tree.
+
+## Terms
+
+1. **Permitted use.** Reading, studying, building, and running this code
+   for security research on devices you own, and for interoperability and
+   defensive analysis. Academic and disclosure use is welcome.
+
+2. **No proprietary redistribution.** You may not sell, license, or
+   redistribute this code or derivatives in proprietary products. If you
+   redistribute, do so under terms at least as restrictive as these,
+   preserve this statement, and keep upstream attributions intact.
+
+3. **Upstream components keep their own licenses.** Nothing in this
+   statement overrides or relicenses any third-party component; those
+   remain governed by their original terms as recorded in `PROVENANCE.md`.
+
+4. **No Nintendo assets.** This repository contains no firmware,
+   copyrighted system data, keys, or content obtained from Nintendo. Do
+   not add any to forks or redistributions.
+
+5. **No warranty; not affiliated.** Provided "as is", without warranty of
+   any kind. This project is not affiliated with, endorsed by, or
+   connected to Nintendo. Using it may void warranties and violate terms
+   of service; that judgment and the consequences are yours.
+
+6. **Responsible disclosure.** If you find a previously unreported
+   vulnerability through this work, disclose it to the vendor
+   responsibly before publishing.

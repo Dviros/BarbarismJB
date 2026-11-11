@@ -1,0 +1,31 @@
+# BarbarismJB — runtime artifacts, never commit
+runs/
+dumps/
+offsets/civ7-100.json
+
+# Nintendo firmware reference archive — copyrighted, 340 MB, never publish
+firmware/
+
+# Vendored third-party tool clones (re-clone per docs/FIRMWARE.md)
+tools/nstool/
+tools/ghidra-switch-loader/
+tools/ghidra-switch-loader-*/
+
+# Python
+__pycache__/
+*.pyc
+
+# Generated self-signed conntest cert (rig regenerates on demand)
+tools/webkit-rig/certs/
+
+# Node
+node_modules/
+
+# macOS
+.DS_Store
+
+# Nintendo OSS source archive (GPL) — 197 MB zip + 774 MB extracted, kept local
+vendor/
+
+# runtime secrets — never commit
+*.key

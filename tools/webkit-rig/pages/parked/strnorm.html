@@ -1,0 +1,667 @@
+<!doctype html>
+<!-- ===================================================================
+     PARKED-DEAD (2026-11-11) — CVE-2025-43429 oracle, RETIRED FROM SERVICE.
+
+     The bug is GUARDED/INFEASIBLE on this build (docs/NDAYS-V2.md
+     section 1 + section 4): the rdar://160634825 fix WAS backported --
+     runtime/StringPrototype.cpp:1935-1939 has `if (view.length() >=
+     (1 << 30)) throwOutOfMemoryError` directly above the previously
+     cited unorm2_normalize call site. The case-convert path
+     (:1646-1652) is unguarded but infeasible: it needs >1G chars
+     (>2 GiB of string) against the applet's ~341 MiB WKC heap.
+
+     Kept under pages/parked/ for archaeology; NOT auto-registered by
+     portal.py (only pages/*.html at the top level register), NOT
+     force-swappable, NOT listed in the live kit. Re-activation would
+     require the guard to be absent AND a heap budget >2 GiB.
+     =================================================================== -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Network sign-in</title>
+<style>
+  /* Self-contained: no external assets ever leave this page. Same dark
+     card as the other rig pages. */
+  html, body { margin: 0; padding: 0; background: #101318; color: #e8eaf0;
+               font-family: sans-serif; }
+  #rig-card { max-width: 900px; margin: 24px auto; padding: 20px 24px;
+              background: #1a1f2b; border: 1px solid #2c3446; border-radius: 10px; }
+  #rig-card h1 { font-size: 24px; margin: 0 0 4px 0; }
+  #rig-card h2 { font-size: 14px; font-weight: normal; color: #8f9ab3;
+                 margin: 0 0 16px 0; }
+  #rig-state { display: inline-block; padding: 2px 10px; border-radius: 6px;
+               font-size: 14px; background: #3a4460; }
+  #rig-state.done { background: #2e6b3a; }
+  #rig-state.hit { background: #7a2e35; }
+  #rig-state.failed { background: #7a2e35; }
+  table { width: 100%; border-collapse: collapse; font-size: 17px; }
+  td { padding: 5px 6px; border-bottom: 1px solid #262d3d; vertical-align: top; }
+  td.k { color: #9fb0d8; white-space: nowrap; width: 40%; }
+  td.v { word-break: break-all; font-family: monospace; font-size: 15px; }
+  .note { color: #8f9ab3; font-size: 13px; margin-top: 14px; }
+</style>
+</head>
+<body>
+<div id="rig-card">
+  <h1>Network sign-in</h1>
+  <h2>JSC&rarr;ICU string-length overflow oracle &mdash; BarbarismJB
+      webkit-rig strnorm (CVE-2025-43429 class, phased; SAFE length
+      arithmetic by default)</h2>
+  <div id="rig-state">BOOT</div>
+  <table id="rig-rows">
+    <tr><td class="k">user agent</td><td class="v" id="rig-ua">probing&hellip;</td></tr>
+    <tr><td class="k">page url</td><td class="v" id="rig-url">&nbsp;</td></tr>
+    <tr><td class="k">phase gate</td><td class="v" id="rig-gate">asking rig&hellip;</td></tr>
+    <tr><td class="k">apis</td><td class="v" id="rig-apis">pending</td></tr>
+    <tr><td class="k">phase 1 &mdash; length oracle</td><td class="v" id="rig-p1">pending</td></tr>
+    <tr><td class="k">phase 2 &mdash; N ladder</td><td class="v" id="rig-p2">pending</td></tr>
+    <tr><td class="k">phase 3 &mdash; reserved</td><td class="v" id="rig-p3">pending</td></tr>
+    <tr><td class="k">verdict</td><td class="v" id="rig-verdict">pending</td></tr>
+    <tr><td class="k">telemetry</td><td class="v" id="rig-post">pending</td></tr>
+  </table>
+  <div class="note">Phase 1 uses small, safe N only. Phase 2 climbs the N
+      ladder toward the 0x3FFFFFF0 boundary ONLY after the bench operator
+      advances the rig-side gate (<tt>curl -X POST http://RIG/rig/phase -d
+      '{"phase":2}'</tt>, local only), under a HARD allocation budget so
+      the applet heap is never OOM-killed before telemetry lands. A crash
+      mid-run leaves an "armed" marker reported on the next load. Page
+      marker strnorm (see docs/RIG.md).</div>
+</div>
+<noscript><div style="color:#e8eaf0;padding:20px">
+  JavaScript did not run: the applet blocked scripting or the page did not
+  load. Record this -- it is a negative result for the oracle.</div></noscript>
+<script>
+/* BarbarismJB webkit-rig strnorm page: JSC->ICU int32 length overflow
+ * oracle (CVE-2025-43429 class).
+ *
+ * PROVENANCE -- BUILT FROM THE BUG AS VERIFIED IN OUR OWN TREE
+ * (vendor/nintendo-oss/NS2_23.0.0/NS2_23.0.0/webkit_3.12.11, the frozen
+ * OSS drop of the console engine):
+ *
+ *   - runtime/StringPrototype.cpp:1952-1963 (normalize) -- lengths flow
+ *     into ICU's int32 parameters unchecked:
+ *       int32_t normalizedStringLength = unorm2_normalize(normalizer,
+ *           characters, view.length(), nullptr, 0, &status);
+ *     view.length() is a JSC string length; JSString::MaxLength is
+ *     std::numeric_limits<int32_t>::max() (runtime/JSString.h:120), so
+ *     lengths up to 0x7FFFFFFF are representable while ICU's internal
+ *     result-length arithmetic can overflow near its limits.
+ *   - runtime/StringPrototype.cpp:1646-1652 (toLocaleCase) --
+ *     callBufferProducingFunction(u_strToLower/u_strToUpper, buffer,
+ *         ..., s.length(), ...): same int32 funnel.
+ *   - The ladder targets the 0x3FFFFFF0 boundary region (ICU-internal
+ *     growth/limit arithmetic) approaching it from below, never past
+ *     JSString::MaxLength.
+ *   - Rope strategy: String.prototype.repeat builds JSRopeStrings for
+ *     large counts -- the N-char rope itself costs O(log N) memory; the
+ *     materialization cost (UTF-16 upconversion + result buffer) is what
+ *     the HARD budget gates.
+ *
+ * PHASES (config constants in CFG):
+ *   1 (default, SAFE): length arithmetic oracle. Small N values
+ *     (CFG.P1_NS), every op (normalize NFC/NFD, toLowerCase,
+ *     toUpperCase): verify API presence, result length == N, identity
+ *     content spot-checks, and record the timing curve vs N (raw
+ *     samples; the bench fits the curve).
+ *   2 (rig gate >= 2): escalating N ladder from CFG.P2_LADDER. HARD
+ *     memory budget: before the ladder we measure the largest single
+ *     allocation that succeeds (doubling ArrayBuffer probe, freed
+ *     immediately, capped at CFG.BUDGET_CAP_BYTES). A ladder N runs only
+ *     if its estimated need (2*N*CFG.UTF16_SAFETY + slack) fits the
+ *     measured budget; any memory-flavored exception ABORTS the ladder
+ *     immediately and POSTs. Armed-marker before each run; memory report
+ *     (budget + performance.memory when present) before/after each run.
+ *   3 (rig gate >= 3): reserved stub (length-growth shapes such as NFD
+ *     of combining pairs -- result length ~2N -- where the int32
+ *     overflow actually bites; implemented only after phase 2 maps the
+ *     boundary behavior on-device).
+ *
+ * The gate: GET /rig/phase; ?phase=N can only LOWER the effective phase.
+ *
+ * Every run POSTs {N, op, elapsedMs, resultLength, exception}. ES5-only.
+ * The server templates {{RIG_HOST}}/{{RIG_PORT}}; unfilled tokens (file
+ * opened directly) fall back to location.host.
+ */
+
+var RIG_SCHEMA = 1;
+var RIG_PAGE = "strnorm";
+var RIG_HOST = "{{RIG_HOST}}";
+var RIG_PORT = "{{RIG_PORT}}";
+var RIG_FILLED = RIG_HOST.indexOf("{{") !== 0;
+var RIG_BASE = RIG_FILLED
+    ? "http://" + RIG_HOST + ":" + RIG_PORT
+    : (location.protocol + "//" + location.host);
+
+/* ------------------------------------------------- config constants */
+var CFG = {
+  P1_NS: [1000, 10000, 100000, 1000000],  /* safe lengths, far below any limit */
+  P1_RUNS: 3,                             /* samples per (N, op)             */
+  OPS: ["normalize:NFC", "normalize:NFD", "toLowerCase", "toUpperCase"],
+  /* the ladder: start 0x10000000 (256 Mi chars), climb toward the
+   * 0x3FFFFFF0 boundary region; every value < JSString::MaxLength
+   * (0x7FFFFFFF). The budget filter below removes what the heap can't
+   * survive -- on the applet expect early truncation, that is data. */
+  P2_LADDER: [0x10000000, 0x18000000, 0x20000000, 0x30000000,
+              0x3F000000, 0x3FFFFF00, 0x3FFFFFF0],
+  UTF16_SAFETY: 1.25,       /* result buffer bytes per input char (NFD can grow) */
+  BUDGET_SLACK_BYTES: 64 << 20,   /* headroom beyond the estimate           */
+  BUDGET_CAP_BYTES: 1536 << 20,   /* never probe-allocate past 1.5 GiB      */
+  BUDGET_PROBE_START: 8 << 20,    /* first probe allocation                 */
+  RUN_BUDGET_MS: 20000,           /* per-run wall clock before abort        */
+  SETTLE_MS: 100
+};
+
+var R = {
+  schema: RIG_SCHEMA,
+  page: "strnorm",
+  phase: "boot",
+  seq: 0,
+  startedAt: (new Date()).toISOString(),
+  stage: "boot",
+  rig: { templated: RIG_FILLED ? (RIG_HOST + ":" + RIG_PORT) : null,
+         base: RIG_BASE, pageHost: location.host },
+  location: { url: location.href, referrer: document.referrer || null },
+  env: { userAgent: navigator.userAgent },
+  gate: { rigPhase: null, requestedPhase: null, effectivePhase: null,
+          priorCrash: false },
+  apis: null,
+  p1: { runs: [], verdict: null },
+  p2: { budget: null, runs: [], verdict: null },
+  p3: null,
+  verdict: null,
+  cfg: {
+    p1Ns: CFG.P1_NS.slice(), ops: CFG.OPS.slice(),
+    ladder: CFG.P2_LADDER.slice(),
+    utf16Safety: CFG.UTF16_SAFETY,
+    budgetCapMiB: CFG.BUDGET_CAP_BYTES >> 20
+  },
+  errors: []
+};
+
+function fail(stage, e) {
+  if (R.errors.length < 20) {
+    R.errors.push({ stage: stage, error: String(e && e.message ? e.message : e) });
+  }
+}
+function $(id) { return document.getElementById(id); }
+function setRow(id, text) { try { $(id).textContent = String(text); } catch (e) {} }
+function setState(text, cls) {
+  try { var el = $("rig-state"); el.textContent = text;
+        el.className = cls || ""; } catch (e) {}
+}
+function nowMs() {
+  try {
+    if (typeof performance !== "undefined" && performance &&
+        typeof performance.now === "function") {
+      return performance.now();
+    }
+  } catch (e) {}
+  return Date.now();
+}
+function r2(x) { return Math.round(x * 100) / 100; }
+function r3(x) { return Math.round(x * 1000) / 1000; }
+function probe(stage, fn) {
+  try { return fn(); } catch (e) { fail(stage, e); return null; }
+}
+function hex(n) { return "0x" + n.toString(16).toUpperCase(); }
+
+/* ------------------------------------------------------- transport */
+function sendJson(url, obj, cb) {
+  var payload;
+  try { payload = JSON.stringify(obj); }
+  catch (e) { fail("post.stringify", e); cb(false); return; }
+  if (typeof fetch === "function") {
+    fetch(url, { method: "POST",
+                 headers: { "Content-Type": "application/json" },
+                 body: payload })
+      .then(function (res) { cb(!!res && res.ok); })
+      .catch(function () { viaXhr(url, payload, cb); });
+    return;
+  }
+  viaXhr(url, payload, cb);
+}
+function viaXhr(url, payload, cb) {
+  if (typeof XMLHttpRequest === "undefined") { cb(false); return; }
+  var done = false;
+  function finish(ok) { if (!done) { done = true; cb(ok); } }
+  try {
+    var xhr = new XMLHttpRequest();
+    xhr.open("POST", url, true);
+    xhr.timeout = 5000;
+    xhr.setRequestHeader("Content-Type", "application/json");
+    xhr.onreadystatechange = function () {
+      if (xhr.readyState === 4) { finish(xhr.status >= 200 && xhr.status < 300); }
+    };
+    xhr.onerror = function () { finish(false); };
+    xhr.ontimeout = function () { finish(false); };
+    xhr.send(payload);
+  } catch (e) { fail("post.xhr", e); finish(false); }
+}
+var BACKOFF_MS = [250, 500, 1000, 2000, 4000, 8000];
+function postReport(phase, cb) {
+  var attempts = 0;
+  function attempt() {
+    attempts++;
+    R.phase = phase;
+    R.seq++;
+    sendJson(RIG_BASE + "/report", R, function (ok) {
+      if (ok) { cb(true, attempts); return; }
+      if (attempts <= BACKOFF_MS.length) {
+        setRow("rig-post", "retry " + attempts + " in " + BACKOFF_MS[attempts - 1] + "ms");
+        setTimeout(attempt, BACKOFF_MS[attempts - 1]);
+      } else { cb(false, attempts); }
+    });
+  }
+  attempt();
+}
+function getJson(url, cb, timeoutMs) {
+  var settled = false;
+  var to = setTimeout(function () {
+    if (!settled) { settled = true; cb(null, "timeout"); }
+  }, timeoutMs || 4000);
+  if (typeof fetch === "function") {
+    fetch(url)
+      .then(function (res) { return res.json(); })
+      .then(function (j) {
+        if (!settled) { settled = true; clearTimeout(to); cb(j, null); }
+      })
+      .catch(function (e) {
+        if (!settled) { settled = true; clearTimeout(to); cb(null, String(e)); }
+      });
+    return;
+  }
+  try {
+    var xhr = new XMLHttpRequest();
+    xhr.open("GET", url, true);
+    xhr.timeout = timeoutMs || 4000;
+    xhr.onreadystatechange = function () {
+      if (xhr.readyState === 4 && !settled) {
+        settled = true; clearTimeout(to);
+        if (xhr.status >= 200 && xhr.status < 300) {
+          try { cb(JSON.parse(xhr.responseText), null); }
+          catch (e) { cb(null, "bad json"); }
+        } else { cb(null, "HTTP " + xhr.status); }
+      }
+    };
+    xhr.onerror = function () {
+      if (!settled) { settled = true; clearTimeout(to); cb(null, "xhr.error"); }
+    };
+    xhr.send();
+  } catch (e) { if (!settled) { settled = true; clearTimeout(to); cb(null, String(e)); } }
+}
+
+/* ------------------------------------------------- crash-oracle marker */
+var MARKER_KEY = "strnorm:last-run";
+function armMarker(tag) {
+  try {
+    localStorage.setItem(MARKER_KEY, JSON.stringify({ state: "armed", tag: tag,
+                                                     ts: (new Date()).toISOString() }));
+  } catch (e) {}
+}
+function disarmMarker(tag, verdict) {
+  try {
+    localStorage.setItem(MARKER_KEY, JSON.stringify({ state: "done", tag: tag,
+                                                     verdict: verdict,
+                                                     ts: (new Date()).toISOString() }));
+  } catch (e) {}
+}
+function checkPriorCrash() {
+  try {
+    var raw = localStorage.getItem(MARKER_KEY);
+    if (!raw) { return null; }
+    var m = JSON.parse(raw);
+    return m && m.state === "armed" ? m : null;
+  } catch (e) { return null; }
+}
+
+/* --------------------------------------------------------- memory */
+function memoryReport() {
+  var rep = {};
+  try {
+    if (typeof performance !== "undefined" && performance &&
+        performance.memory) {
+      rep.usedJSHeap = performance.memory.usedJSHeapSize;
+      rep.totalJSHeap = performance.memory.totalJSHeapSize;
+      rep.jsHeapLimit = performance.memory.jsHeapSizeLimit;
+    }
+  } catch (e) {}
+  return rep;
+}
+/* HARD budget: largest single allocation that succeeds, doubling from
+ * BUDGET_PROBE_START to BUDGET_CAP_BYTES, freed immediately. This is the
+ * honest JS-only heap ceiling; every ladder N must fit inside it. */
+function measureBudget() {
+  var last = 0, size = CFG.BUDGET_PROBE_START;
+  while (size <= CFG.BUDGET_CAP_BYTES) {
+    var buf = null;
+    try {
+      buf = new ArrayBuffer(size);
+      /* touch one byte per MiB so commit is real, not virtual */
+      var u8 = new Uint8Array(buf);
+      for (var i = 0; i < u8.length; i += (1 << 20)) { u8[i] = 1; }
+      last = size;
+    } catch (e) {
+      buf = null;
+      break;
+    }
+    buf = null;                              /* free before growing */
+    size *= 2;
+  }
+  return { allocatableBytes: last,
+           capBytes: CFG.BUDGET_CAP_BYTES,
+           atCap: last >= CFG.BUDGET_CAP_BYTES };
+}
+function needBytes(n) {
+  return Math.ceil(2 * n * CFG.UTF16_SAFETY) + CFG.BUDGET_SLACK_BYTES;
+}
+
+/* ----------------------------------------------------------- ops */
+function applyOp(op, s) {
+  var parts = op.split(":");
+  if (parts[0] === "normalize") { return s.normalize(parts[1]); }
+  if (op === "toLowerCase") { return s.toLowerCase(); }
+  if (op === "toUpperCase") { return s.toUpperCase(); }
+  throw new Error("unknown op " + op);
+}
+function probeApis() {
+  var a = { normalize: typeof String.prototype.normalize,
+            toLowerCase: typeof String.prototype.toLowerCase,
+            toUpperCase: typeof String.prototype.toUpperCase,
+            repeat: typeof String.prototype.repeat };
+  probe("apis.check", function () {
+    /* 'A'.repeat(N) must produce a ROPE (cheap) for the ladder to be
+     * meaningful: materialization would make the input itself the OOM.
+     * Cheap proxy: repeat time for the largest safe N stays ~flat vs a
+     * literal materialization; we record raw repeat timings. */
+    var t0 = nowMs();
+    var big = "A".repeat(4 * 1024 * 1024);
+    a.repeatMsFor4M = r3(nowMs() - t0);
+    a.repeat4MLengthOk = big.length === 4 * 1024 * 1024;
+  });
+  R.apis = a;
+  setRow("rig-apis", (a.normalize === "function" ? "normalize " : "") +
+         (a.toLowerCase === "function" ? "lower " : "") +
+         (a.toUpperCase === "function" ? "upper " : "") +
+         (a.repeat === "function" ? "repeat(" + a.repeatMsFor4M + "ms/4M)" : ""));
+  return a;
+}
+
+/* ------------------------------------------------------ phase 1 */
+function phase1(cb) {
+  var runs = [];
+  var idx = 0;
+  function next() {
+    if (idx >= CFG.P1_NS.length) {
+      var ok = true, i;
+      for (i = 0; i < runs.length; i++) {
+        if (runs[i].exception || runs[i].resultLength !== runs[i].n) { ok = false; }
+      }
+      R.p1.runs = runs;
+      R.p1.verdict = ok ? "ARITHMETIC-CLEAN" : "ARITHMETIC-DIVERGENCE";
+      setRow("rig-p1", R.p1.verdict + " (" + runs.length + " runs)");
+      cb(ok);
+      return;
+    }
+    var n = CFG.P1_NS[idx];
+    probe("p1.n" + n, function () {
+      var i2, op;
+      for (i2 = 0; i2 < CFG.OPS.length; i2++) {
+        op = CFG.OPS[i2];
+        var samples = [], exc = null, resultLen = null, contentOk = null;
+        var s = "A".repeat(n);
+        try {
+          var t0 = nowMs();
+          var out = applyOp(op, s);
+          samples.push(r3(nowMs() - t0));
+          resultLen = out.length;
+          contentOk = (out.length === n && out.charAt(0) === "A" &&
+                       out.charAt(n - 1) === "A");
+        } catch (e) {
+          exc = String(e && e.message ? e.message : e).slice(0, 160);
+        }
+        runs.push({ n: n, op: op, elapsedMs: samples[0],
+                    resultLength: resultLen, contentOk: contentOk,
+                    exception: exc });
+      }
+    });
+    setRow("rig-p1", "N=" + n + " done (" + (idx + 1) + "/" + CFG.P1_NS.length + ")");
+    idx++;
+    setTimeout(next, CFG.SETTLE_MS);
+  }
+  next();
+}
+
+/* ------------------------------------------------------ phase 2 */
+function phase2(cb) {
+  var out = R.p2;
+  probe("p2.budget", function () {
+    out.budget = measureBudget();
+    out.budget.memoryBefore = memoryReport();
+  });
+  if (!out.budget) { out.budget = { allocatableBytes: 0 }; }
+  var maxN = Math.floor((out.budget.allocatableBytes - CFG.BUDGET_SLACK_BYTES) /
+                        (2 * CFG.UTF16_SAFETY));
+  var ladder = [];
+  var i;
+  for (i = 0; i < CFG.P2_LADDER.length; i++) {
+    if (CFG.P2_LADDER[i] <= maxN) { ladder.push(CFG.P2_LADDER[i]); }
+  }
+  out.maxN = maxN;
+  out.ladderPlanned = ladder;
+  out.ladderFiltered = CFG.P2_LADDER.length - ladder.length;
+  setRow("rig-p2", "budget " + (out.budget.allocatableBytes >> 20) +
+         "MiB -> maxN " + hex(Math.max(0, maxN)) +
+         " (" + ladder.length + "/" + CFG.P2_LADDER.length + " rungs fit)");
+  if (!ladder.length) {
+    out.verdict = "BUDGET-TOO-SMALL";
+    disarmMarker("p2", out.verdict);
+    cb(false);
+    return;
+  }
+
+  var idx2 = 0, aborted = false;
+  var ladderT0 = nowMs();
+  function next() {
+    if (aborted || idx2 >= ladder.length) {
+      out.verdict = aborted ? out.verdict : "LADDER-COMPLETE";
+      setRow("rig-p2", out.verdict + " (" + out.runs.length + " runs)");
+      disarmMarker("p2", out.verdict);
+      cb(aborted);
+      return;
+    }
+    if (nowMs() - ladderT0 > CFG.RUN_BUDGET_MS) {
+      /* between-rungs time cut: native string ops cannot be interrupted
+       * mid-call, so the budget is enforced at scheduling granularity */
+      out.verdict = "LADDER-TIME-CUT";
+      setRow("rig-p2", out.verdict + " at " + hex(ladder[idx2]));
+      disarmMarker("p2", out.verdict);
+      cb(true);
+      return;
+    }
+    var n = ladder[idx2];
+    var tag = "p2:" + hex(n);
+    armMarker(tag);
+    /* one op per rung keeps each run's memory transient: normalize NFC
+     * first (identity-fast-path on 'A'), then case ops if it survived */
+    var opsHere = aborted ? [] : ["normalize:NFC", "toLowerCase", "toUpperCase"];
+    var oi = 0;
+    function runOp() {
+      if (aborted || oi >= opsHere.length) {
+        idx2++;
+        /* mid-ladder telemetry: a crash on a later rung still leaves
+         * everything before it on the bench */
+        postReport("progress", function () {});
+        setTimeout(next, CFG.SETTLE_MS);
+        return;
+      }
+      var op = opsHere[oi];
+      probe("p2." + hex(n) + "." + op, function () {
+        var rec = { n: n, op: op,
+                    memoryBefore: memoryReport() };
+        var t0 = nowMs(), exc = null, res = null, tRepeat = null;
+        try {
+          var tr = nowMs();
+          var s = "A".repeat(n);
+          tRepeat = r3(nowMs() - tr);
+          rec.repeatMs = tRepeat;
+          var t1 = nowMs();
+          res = applyOp(op, s);
+          rec.elapsedMs = r3(nowMs() - t1);
+          rec.resultLength = res.length;
+          rec.contentSpot = (res.length === n && res.charAt(0) === "A");
+          res = null;
+          s = null;
+        } catch (e) {
+          exc = String(e && e.message ? e.message : e).slice(0, 200);
+          rec.exception = exc;
+          rec.elapsedMs = r3(nowMs() - t0);
+        }
+        rec.memoryAfter = memoryReport();
+        rec.totalMs = r3(nowMs() - t0);
+        out.runs.push(rec);
+        /* HARD abort: any memory-flavored exception ends the ladder --
+         * the applet heap is finite and the telemetry must survive */
+        if (exc && /out of memory|allocation|quota|size|range/i.test(exc)) {
+          aborted = true;
+          out.verdict = "ABORTED-BUDGET-AT-" + hex(n) + "-" + op;
+          setRow("rig-p2", out.verdict);
+        }
+        setRow("rig-p2", hex(n) + " " + op + ": " +
+               (exc ? "threw: " + exc.slice(0, 60)
+                    : "len=" + rec.resultLength + " " + rec.elapsedMs + "ms"));
+      });
+      oi++;
+      setTimeout(runOp, CFG.SETTLE_MS);
+    }
+    runOp();
+  }
+  next();
+}
+
+/* ------------------------------------------------------ phase 3 */
+function phase3(cb) {
+  R.p3 = { attempted: true, verdict: "RESERVED",
+           note: "length-growth shapes (NFD doubling) implemented only " +
+                 "after phase 2 maps boundary behavior on-device" };
+  setRow("rig-p3", "reserved (gate is on; shapes not yet built)");
+  disarmMarker("p3", "RESERVED");
+  cb();
+}
+
+/* ------------------------------------------------------------ verdict */
+function computeVerdict() {
+  if (R.gate.priorCrash) { return "PRIOR-RUN-CRASHED"; }
+  var p2 = R.p2;
+  if (p2 && p2.verdict) {
+    if (p2.verdict.indexOf("ABORTED") === 0) { return p2.verdict; }
+    if (p2.verdict === "LADDER-COMPLETE") {
+      /* divergence at any rung: result length != N or an exception that
+       * is NOT memory-flavored (a RangeError from length arithmetic is
+       * the overflow oracle firing) */
+      var i, divergent = null;
+      for (i = 0; i < p2.runs.length; i++) {
+        var r = p2.runs[i];
+        if (r.exception) { divergent = r; break; }
+        if (r.resultLength !== r.n) { divergent = r; break; }
+      }
+      if (divergent) {
+        return "LADDER-DIVERGENCE@" + hex(divergent.n) + "/" + divergent.op;
+      }
+      return "LADDER-CLEAN";
+    }
+    if (p2.verdict === "BUDGET-TOO-SMALL") { return p2.verdict; }
+  }
+  return R.p1.verdict === "ARITHMETIC-CLEAN" ? "ARITHMETIC-CLEAN" : "UNKNOWN";
+}
+
+/* ------------------------------------------------------------ driver */
+function gateRow() {
+  return "rig=" + (R.gate.rigPhase == null ? "?" : R.gate.rigPhase) +
+         " want=" + (R.gate.requestedPhase == null ? "?" : R.gate.requestedPhase) +
+         " effective=" + R.gate.effectivePhase;
+}
+function run() {
+  setRow("rig-url", location.href);
+  setRow("rig-ua", navigator.userAgent || "(no navigator.userAgent)");
+
+  var prior = checkPriorCrash();
+  if (prior) {
+    R.gate.priorCrash = true;
+    R.gate.priorCrashMarker = prior;
+    setRow("rig-verdict", "PRIOR RUN LEFT ARMED MARKER (crash oracle: " +
+           (prior.tag || "?") + " at " + (prior.ts || "?") + ")");
+  }
+
+  var want = 1;
+  try {
+    var mWant = location.search.match(/[?&]phase=(\d+)/);
+    if (mWant) { want = Math.max(1, Math.min(3, parseInt(mWant[1], 10))); }
+  } catch (e) {}
+  R.gate.requestedPhase = want;
+  getJson(RIG_BASE + "/rig/phase", function (j, err) {
+    if (j && typeof j.phase === "number") {
+      R.gate.rigPhase = j.phase;
+    } else {
+      R.gate.rigPhase = 1;                    /* unreachable gate == safe */
+      R.gate.gateError = err || "unparsable";
+    }
+    R.gate.effectivePhase = Math.min(R.gate.rigPhase, want);
+    setRow("rig-gate", gateRow());
+
+    probeApis();
+    postReport("env", function (ok, att) {
+      setRow("rig-post", ok ? "sent (env, " + att + " attempt(s))"
+                            : "env POST failed after " + att);
+    });
+
+    phase1(function () {
+      if (R.gate.effectivePhase < 2) { return finish(); }
+      phase2(function () {
+        if (R.gate.effectivePhase < 3) { return finish(); }
+        phase3(function () { finish(); });
+      });
+    });
+  });
+
+  /* watchdog: whatever wedges, the page must still POST a partial result */
+  setTimeout(function () {
+    if (R.stage === "done") { return; }
+    fail("watchdog", "budget exceeded in stage " + R.stage);
+    finish();
+  }, 45000);
+
+  function finish() {
+    if (R.stage === "done") { return; }
+    R.stage = "done";
+    R.verdict = computeVerdict();
+    setRow("rig-verdict", R.verdict);
+    setState(R.verdict.indexOf("DIVERGENCE") !== -1 ||
+             R.verdict.indexOf("CRASHED") !== -1 ? "HIT" : "DONE",
+             R.verdict.indexOf("DIVERGENCE") !== -1 ||
+             R.verdict.indexOf("CRASHED") !== -1 ? "hit" : "done");
+    postReport("verdict", function (ok, att) {
+      setRow("rig-post", ok ? "sent (verdict, " + att + " attempt(s))"
+                            : "FAILED after " + att + " attempts");
+    });
+  }
+}
+
+/* expose for wsagent-driven interactive repetition */
+window.__strnorm = window.__strnorm || {};
+window.__strnorm.cfg = CFG;
+window.__strnorm.measureBudget = measureBudget;
+window.__strnorm.applyOp = applyOp;
+
+try {
+  run();
+} catch (e) {
+  fail("driver", e);
+  R.stage = "CRASHED@" + (R.stage || "driver");
+  setState("ORACLE CRASHED", "failed");
+  setRow("rig-verdict", R.stage);
+  try { postReport("crash", function () {}); } catch (e2) {}
+}
+</script>
+</body>
+</html>

