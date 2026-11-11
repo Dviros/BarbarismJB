@@ -29,3 +29,7 @@ vendor/
 
 # runtime secrets — never commit
 *.key
+
+# usb-mtp: libptp2 subset build artifacts (rebuilt via build.sh)
+tools/usb-mtp/libptp2-build/
+tools/usb-mtp/mtp_probe_libpt2

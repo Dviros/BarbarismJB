@@ -127,7 +127,30 @@ handling rules (keys stay outside this repository).
    with any copy of the corresponding code. This repository's top-level
    README repeats them for visibility; this file is the authoritative record.
 
-4. **Scope of use.** Research on hardware you own. Like upstream ns2jb, this
+4. **The usb-mtp libptp2 subset is LGPL-2.1-affected.**
+   `tools/usb-mtp/mtp_probe_libpt2` statically compiles `ptp.c`, the
+   `ptp-pack.c` embedded in `libusb1-glue.c`, and `libusb1-glue.c` VERBATIM
+   from **libmtp 1.1.23** (LGPL-2.1-or-later) — the same transaction library
+   libmtp itself uses, for byte-identical transport parity against the
+   console's capmtp responder. A static subset is a derivative work:
+   - Source of record: the libmtp 1.1.23 release tarball
+     (libmtp-1.1.23.tar.gz, md5 `9d1ead73e678fa2f51a70a933b0bf017`);
+     working copy at build time: `/tmp/libmtp-src/libmtp-1.1.23/src/`
+     (local file hashes: ptp.c `2e5212e82868c204361f1cf0c33762e5`,
+     ptp.h `5d9f3be07b042d6a6f85be778c19a917`,
+     ptp-pack.c `b072e4818dae12de79fbc3ffc59a4113`,
+     libusb1-glue.c `6195437485a4819d125a7f19b1bc7c1b`).
+   - `tools/usb-mtp/libmtp_shims.c` provides the only four libmtp.c/util.c/
+     mtpz.c symbols the subset references; everything else is unmodified.
+   - LGPL obligations for anyone distributing the BINARY: accompany it with
+     the libmtp 1.1.23 source (or a written offer), keep the LGPL notices
+     in the carried files intact, and permit relinking of the subset
+     (shipping `libptp2-build/*.o` + build.sh satisfies this for object-
+     level relinking). The in-repo copy keeps sources out of the tree only
+     because the tarball already lives on the bench; do not distribute the
+     binary without them.
+
+5. **Scope of use.** Research on hardware you own. Like upstream ns2jb, this
    project installs nothing, persists nothing, and includes no piracy
    capability; a reboot undoes a run. The firmware dump tooling captures
    code Nintendo owns the copyright to — keep dumps and any keys private,
