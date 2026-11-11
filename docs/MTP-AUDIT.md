@@ -52,3 +52,18 @@ candidate: send CloseSession with the correct live txid).
 
 **usbsys** (the transport that synthesizes error containers when capmtp is
 silent) — its container writer is itself an unaudited parser below the parser.
+
+## Live v3 results (2026-11-11 night, second session)
+
+- **cancel_injection CONFIRMED: 2-byte repro** — container with word0=0x4001
+  on the command pipe latches the zombie from CLEAN state in 0.15ms. No
+  session, no data phase, no handles. The report's headline artifact.
+- **Two-phase zombie decoded via raw capture** (journal
+  mtp-libptp-20261111T1855xx): Phase A = canned 0x2FF (fast or 20s); Phase B =
+  OUT endpoint hard-dead (writes timeout even post-clear_halt) while IN still
+  delivered an ENGINE-AUTHORED response (type=3, txid=2 echo, 0x2009 — the
+  abandoned GetObject's closeout). Engine alive mid-zombie — the latch model
+  is incomplete; usbsys owns endpoint death + 0x2FF synthesis + the 20s timer.
+- **usbsys.bin audit DISPATCHED** (device-mode data path, 0x2FF synthesizer,
+  transfer-ring counterpart, memory-safety of the bulk-stream parser — the
+  Path-to-userland verdict for the USB lane).
