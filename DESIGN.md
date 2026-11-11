@@ -105,6 +105,18 @@ are found by one bootstrap procedure:
 
 No RWX exists below fs compromise, and none is needed:
 
+> **2026-11-11 correction (civswitch-kit hardware evidence):** `pthread_create`
+> on Civ 7 1.0.0 **returns 0 but silently never inserts a worker** (no
+> manager-list node; the frame sentinel stays untouched), and
+> `nn::os::CreateThread` hangs before `StartThread`. The hardware-qualified
+> path is raw `svcCreateThread` (svc #0x08) with entry=longjmp, priority
+> borrowed from a live nn::os manager-list node (observed 43), and a
+> mask-valid core — civshim ops 12–15, the `rawsvc` worker backend, and
+> `--check-workers --worker rawsvc`. The pthread ops (8/9) and the ropchain
+> backend remain for hosts where pthreads work. Exit gadgets: `svc #0x0A`
+> wrapper for raw threads — **`svc #0x07` is svcExitProcess and kills the
+> game**. See docs/CIVSWITCH-INTEGRATION.md §2c.
+
 - `THREAD` op in civshim: `pthread_create(&t, NULL, longjmp, jb)` — the
   ns2jb trick. The forged `jmp_buf` restores a full register context
   (x19–x30, sp, pc) whose `pc`/`sp` land in a **per-thread ROP chain** built

@@ -141,6 +141,13 @@ BarbarismJB/
   payloads/
     civshim.js         console-side bridge shim (:39381)   — send via :9026
     dumper.js          M0 memory dumper                    — send via :9026
+  engine/carrier/civ7js/    the CivSwitch carrier layer (docs/CIVSWITCH-INTEGRATION.md):
+    loader-client.cjs  host client for the :9026 loader (half-close + log stream)
+    build-carrier.cjs  bakes offsets/civ7-100.json into payloads/civshim.js
+    deploy.cjs         one-shot deploy (build -> push -> await the shim listener)
+    import-civswitch-offsets.cjs  seeds offsets/civ7-100.json from the
+                       hardware-validated civswitch-kit tables (GPL-2.0; provenance
+                       in the emitted file's _civswitch block)
   offsets/
     civ7-100.template.json   offsets schema (M0 output fills civ7-100.json)
     README.md                M0 workflow + svc ground-truth table
@@ -153,9 +160,17 @@ BarbarismJB/
   tests/
     protocol-conformance.cjs  fake console over real sockets vs the real host stack
     civshim-sim.cjs           civshim.js eval'd against stubbed loader primitives
+                              (ops 1-15, incl. the raw-svc thread surface)
+    civ7js-carrier-test.cjs   the carrier layer: loader client vs a fake :9026,
+                              carrier bake validity + drift detection, kit import
     run-all.sh                everything, headless, exits non-zero on failure
   firmware/            reference 23.0.1 archive (encrypted NCAs; see docs/FIRMWARE.md)
   docs/
+    CIVSWITCH-INTEGRATION.md  the hardware-proven CN kit mapped onto this engine:
+                              architecture, the raw-svc thread facts, the
+                              offsets transfer table, what we built on top
+    CIVSWITCH-RUNBOOK.md     the day-of delivery plan (loader -> engine -> fs
+                              ARW -> PID1 -> the ns_ssversion gate clear)
     FIRMWARE.md           acquisition/decrypt/decompile/emulate verdicts
     STATIC-VALIDATION.md IPC + NPDM findings vs the reference fw-23.0.1 dump
     SHELL.md              the shell: architecture, commands, security
@@ -176,9 +191,10 @@ host and console on the same LAN, 90DNS active, Node ≥ 22 on the host.
 # 0) sanity — every time, before touching the console:
 bash tests/run-all.sh
 
-# 1) M1 transport check — load the shim, then verify the bridge:
-python3 send_js.py <console-ip> payloads/civshim.js   # via the :9026 loader
-node run.cjs --check <console-ip>
+# 1) M1 transport check — deploy the shim THROUGH the loader, then verify:
+node run.cjs --deploy --check <console-ip>
+#    (equivalent manual route: python3 send_js.py <console-ip> payloads/civshim.js
+#     from a CivSwitch checkout, then node run.cjs --check <console-ip>)
 #    expect: hello bases, PING/QUERY/ALLOC/WRITE+READ/CALL(sleep)/FREE ok,
 #    "M1 transport check passed."  (Pre-M0: QUERY/SLEEP report unavailable.)
 
@@ -191,8 +207,10 @@ python3 tools/svc_scan.py dumps/run1/sdk_0_*.bin --base 0x<base> --out sdk-scan.
 python3 tools/gadget_scan.py dumps/run1/main_0_*.bin --base 0x<base> --find pivot_mov_sp
 #    (assembly recipe: offsets/README.md)
 
-# 4) M2 worker check — N ropchain workers (sleep+memcpy), joined + verified:
-node run.cjs --check-workers 4 <console-ip>
+# 4) M2 worker check — N workers (sleep+memcpy), joined + verified:
+node run.cjs --check-workers 4 --worker rawsvc <console-ip>
+#    (--worker rawsvc = the civswitch-kit hardware path: ops 15/12/13/14 —
+#     borrowed scheduling, raw svcCreateThread, svcWaitSynchronization poll)
 
 # 5) stages (after the M0 offsets table is filled — see below):
 node run.cjs --stage acquire <console-ip>
@@ -231,9 +249,11 @@ All multi-byte fields little-endian.
 
 Then a 256-byte NUL-padded JSON trailer: the console's known-offsets dict
 `{"svc":{...},"sdk_offsets":{...}}` (module-relative, same keys as
-`offsets/civ7-100.json`; `null` = unknown on-console). The host cross-checks
-it against its own table (`lib/offsets.cjs`), and pushes corrections with
-op 11.
+`offsets/civ7-100.json`; **non-null leaves only** — the full key set no longer
+fits 256 bytes, and an over-budget dict degrades to empty groups because the
+host re-uploads its authoritative copy with op 11 anyway). The host
+cross-checks it against its own table (`lib/offsets.cjs`), and pushes
+corrections with op 11.
 
 **Request** (host → console): `u32 magic 0x43495631, u32 op, u32 id, u32
 payloadLen`, then `payloadLen` bytes. **Response** (console → host): same
@@ -253,6 +273,10 @@ header with `op | 0x80000000`, then `u32 status` (0 ok, 1 op-unavailable,
 | 9 THREAD_JOIN | `u64 thread` | — | `pthread_join(thread, NULL)` (blocks the JS thread; safe: workers never re-enter JS) |
 | 10 SLEEP | `u64 ns` | — | svcSleepThread wrapper |
 | 11 UPD_OFFSETS | JSON `{"svc":…,"sdk_offsets":…,"modules":…}` | merged dict | runtime offset update (persists for the session; `null` never downgrades a live value; non-numeric leaves are rejected) |
+| 12 THREAD_CREATE_RAW | `u64 jbPtr; u64 stackTop; u32 priority; u32 core` | `u64 handle; u64 createResult; u64 startResult` | **the Civ 7 hardware path**: `svcCreateThread(slot, longjmp, jbPtr, stackTop, priority, core)` + `svcStartThread` — pthread_create silently no-ops and nn::os::CreateThread hangs on Civ 7 1.0.0 (civswitch-kit, hardware-qualified 2026-11-02). Kernel rejections (0xE001) come back as payload values so the host can retry another borrowed core. Exit inside worker chains must be the svc #0x0A wrapper — #0x07 is svcExitProcess |
+| 13 THREAD_WAIT | `u64 handle; u64 timeoutNs` | `u64 result; u64 index` | single-shot svcWaitSynchronization; result 0 = signaled, 0xEA01 = wait timeout (poll again); host drives the 10 ms poll loop |
+| 14 THREAD_CLOSE | `u64 handle` | `u64 result` | svcCloseHandle on a raw thread handle |
+| 15 THREAD_SCHED_BORROW | — | `u64 priority; u64 coreMask; u64 manager; u64 nodes` | on-console nn::os manager-list walk (`sdk_offsets.thread_manager_global`, bias 0xF0, sentinel +0x1D0, handle@+0x1B0); priority + usable cores are BORROWED from a live game thread via svcGetThreadPriority/svcGetThreadCoreMask (observed 43/44/59/28) |
 
 Degradation: with an all-empty dict (before M0 / before the host's op-11
 upload), PING/CALL/READ/WRITE/ALLOC/FREE still work — CALL takes absolute
@@ -280,7 +304,7 @@ the ns2jb engine (verified by full-tree diff). All changes are marked
 | `lib/qualify.cjs`, `lib/native.cjs` | Marked unused (SmileBASIC app qualifier / DSC1 native client). Their role is filled by hello validation + first-page sha256 pins + the Civshim transport. |
 | `shared/errors.cjs`, `shared/log.cjs`, `shared/version.cjs` **(new)** | First-party additions: one error-code taxonomy, a zero-dependency leveled/tagged logger, and the version constant. |
 | `switch2/app/session.cjs` | `initialize` → civshim ALLOC (game calloc) + QUERY validation (memset optional — falls back to zero WRITEs). `openService` → one `svcConnectToNamedService("sm:")` (TIPC GetService ported verbatim from ns2jb `ro/control.cjs` 'sm-service', hardware-proven on 23.0.1). `ipc()` → CMIF via `shared/ipc.cjs` staged into the ALLOC'd buffer, sent with the svcSendSyncRequest wrapper (`x0=buffer, x1=4096, x2=handle`). Logical `call('send'\|'close'\|'memset'\|'free')` map to offsets/civshim ops. |
-| `switch2/app/native-worker.cjs` + `shared/frames.cjs` | New worker backend **ropchain** (default; `BARBARISM_WORKER=frames` or `--worker frames` keeps the legacy SmileBASIC 4-gadget frames). The host compiles each worker's call list into a linear ROP chain + forged jmp_buf with `buildRop()` — same gadget set and frame stride as CivSwitch core.js's proven `call_rop` (args_loader/frame_ldp/indirect_call/load_x21/store_result; per-call stride 0xE0, pointer-chain cells, SENTINEL result slots, dynamic `{u32}` args expanded to memcpy loads, pthread_exit tail). Buffer staged via WRITE and verified by full read-back (no SDK hash/memset assumed). Launch/join/parking/cancellation are backend-aware; `join` blocks on-console (no tryjoin pin yet; 180 s bridge stop is the bound). |
+| `switch2/app/native-worker.cjs` + `shared/frames.cjs` | New worker backend **ropchain** (default; `BARBARISM_WORKER=frames` or `--worker frames` keeps the legacy SmileBASIC 4-gadget frames). The host compiles each worker's call list into a linear ROP chain + forged jmp_buf with `buildRop()` — same gadget set and frame stride as CivSwitch core.js's proven `call_rop` (args_loader/frame_ldp/indirect_call/load_x21/store_result; per-call stride 0xE0, pointer-chain cells, SENTINEL result slots, dynamic `{u32}` args expanded to memcpy loads, pthread_exit tail). Buffer staged via WRITE and verified by full read-back (no SDK hash/memset assumed). Launch/join/parking/cancellation are backend-aware; `join` blocks on-console (no tryjoin pin yet; 180 s bridge stop is the bound). A third backend **rawsvc** (`--worker rawsvc`) builds the same chains but launches them through the civswitch-kit raw `svcCreateThread` path (ops 12-15) with the chain tail at the svc #0x0A wrapper — the hardware-qualified mode for Civ 7 1.0.0, where pthread_create silently no-ops (docs/CIVSWITCH-INTEGRATION.md §2c). |
 | `switch2/app/worker.cjs` | Worker entry verification: frames backend keeps the original instruction pins; ropchain backend resolves pthread_create/join/exit, longjmp, and the sleep svc from the offsets table and checks executable mappings. |
 | `switch2/memory/probe-reserved-gap.cjs` | All geometry constants (59×208 reservations, pin cost 13616, 0x2600 pre-release, 0x2440 extent, margins, wave attempts, …) became named `GEOMETRY` knobs with the proven 23.0.1 + SmileBASIC values as defaults. Scratch mounts come from `MOUNTS` (`primary` = donor source: `save` for Civ 7, `tmp` = legacy; `secondary` = tmp). Own-storage command (200) from config, `storageSize` always re-measured. Native entries (send/memcpy/memset) resolve from the offsets table; the SmileBASIC memcpy instruction pin is kept for the frames backend, replaced by an executable-mapping check + explicit warning for ropchain. Wave worker cancellation/`join` path is backend-aware. |
 | `switch2/ro/files.cjs` | Donor filesystem from config: `save` (Civ 7 default) writes `/main` + `/main.npdm` at the **save root only** (filenames validated root-level; never inside `save:/saves/` where `XSTRIG.Civ7Save` lives); `tmp` reproduces the ns2jb donor. Donor-mount consistency is asserted across operations. |
@@ -345,6 +369,11 @@ Schema: see `offsets/civ7-100.template.json` and `offsets/README.md`
 - `modules.*.first_page_sha256`: pin, checked by `run.cjs` before anything
   native runs (absent → warning; present + mismatch → abort).
 - The engine consumes only Numbers; JSON never carries BigInts.
+- **Seeding**: `node engine/carrier/civ7js/import-civswitch-offsets.cjs
+  <civswitch-kit-checkout>` fills 38 hardware-validated values (GPL-2.0 kit
+  provenance recorded in the file's `_civswitch` block; the game's modules are
+  cartridge-build constants, so the values carry across firmware) and leaves
+  the documented M0 remainder null — `docs/CIVSWITCH-INTEGRATION.md` §4.
 
 ## Console test checklist (per milestone)
 
@@ -410,12 +439,20 @@ which runs, in order:
    oversized frames, bad magic, unknown ops);
 3. `node tests/civshim-sim.cjs` — the real `payloads/civshim.js`, eval'd
    against stubbed loader primitives over a real in-process socket pair:
-   hello layout, ops, coalesced WRITE with byte-exact overshoot flush
-   (unaligned tails included), the degrade-then-upload lifecycle, malformed
-   frames, and the null-never-downgrades merge rule. (This simulation caught
+   hello layout, ops 1-15 (including the raw-svc thread surface 12-15:
+   manager-list borrow, kernel-rejection-as-payload, 0xEA01 poll), coalesced
+   WRITE with byte-exact overshoot flush (unaligned tails included), the
+   degrade-then-upload lifecycle, malformed frames, and the
+   null-never-downgrades merge rule. (This simulation caught
    real bugs pre-release: a `take()` double-count deadlock, wrong bridge
    header word offsets, and a scratch-boundary BigInt mix — all fixed.);
-4. python self-tests: `tools/svc_scan.py --self-test`,
+4. `node tests/civ7js-carrier-test.cjs` — the CivSwitch carrier layer: the
+   :9026 loader client against a fake loader over real sockets (half-close
+   discipline, log streaming, marker wait, idle timeout, the empty-payload
+   bad-connection refusal), the carrier baker (offsets embedded, output
+   syntax-checked, anchor-drift detection), and the civswitch-kit offsets
+   importer against a fixture kit;
+5. python self-tests: `tools/svc_scan.py --self-test`,
    `tools/gadget_scan.py --self-test`, `tools/dump_recv.py --self-test`,
    `tools/make_test_nso.py`.
 

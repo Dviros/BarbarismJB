@@ -13,7 +13,11 @@
 //                   offsets.gadgets + forged jmp_buf) or 'frames' (the legacy
 //                   ns2jb SmileBASIC 4-gadget worker frames — only usable once
 //                   Civ 7 equivalents of loadTable/call4/saveResult64/exit are
-//                   fingerprinted into app/thread-code.json).
+//                   fingerprinted into app/thread-code.json) or 'rawsvc'
+//                   (ropchain chains launched through the civswitch-kit
+//                   hardware-qualified raw svcCreateThread path: pthread_create
+//                   silently no-ops on Civ 7 1.0.0, so this is the backend the
+//                   wave should use on hardware — civshim ops 12-15).
 //   BARBARISM_DONOR   'save' (default; donor = clone of the game's save: mount,
 //                   /main + /main.npdm written at the save root — never inside
 //                   save:/saves/ where XSTRIG.Civ7Save lives) or 'tmp' (the
@@ -46,7 +50,7 @@ function unported(what) {
 }
 
 module.exports = {
-  workerBackend: () => pick('BARBARISM_WORKER', ['ropchain', 'frames'], 'ropchain'),
+  workerBackend: () => pick('BARBARISM_WORKER', ['ropchain', 'frames', 'rawsvc'], 'ropchain'),
   donorMountSource: () => pick('BARBARISM_DONOR', ['save', 'tmp'], 'save'),
   ownStorageCommand: () => Number(pick('BARBARISM_OWN_STORAGE_CMD', ['200'], 200)),
   unported,

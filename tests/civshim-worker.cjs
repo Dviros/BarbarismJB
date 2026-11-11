@@ -79,6 +79,54 @@ def(0x3100, (thread, unused) => {joins.push(thread.toString()); return 0n;}); //
 def(0x3200, () => 0n);                                                        // pthread_exit
 def(0x4000, (start, jb) => 0n);                                               // longjmp (recorded via pthread_create)
 def(0x50, (a, b, c, d, e, f) => BigInt.asUintN(64, a + b + c + d + e + f));   // sum6 (CALL test)
+
+// ---- fake raw-svc thread natives (civshim ops 12-15; offsets 0x51xx) --------
+// Shapes mirror the civswitch-kit thread-code.json rawSvc.functions wrappers
+// (hardware-qualified on Civ 7 1.0.0): svcCreateThread(out, entry, arg,
+// stackTop, priority, core) with entry=longjmp and arg=frame base;
+// svcWaitSynchronization(out, handles, count, timeoutNs) returning 0xEA01
+// (kernel wait timeout) until the simulated thread "finishes" on its second
+// poll; priority/core borrowed through the manager-list walk (op 15).
+const rawThreads = [], waits = [];
+const waitPolls = new Map(); // handle -> polls so far
+let nextHandle = 0x5000n;
+def(0x5100, (out, entry, arg, stackTop, priority, core) => { // svcCreateThread (#0x08)
+  if (core === 0n || priority === 0n || priority >= 64n) return 0xe001n;
+  const handle = nextHandle++;
+  write64(out, handle); // u32 handle in the low word
+  rawThreads.push({entry: entry.toString(), arg: arg.toString(), stackTop: stackTop.toString(),
+    priority: priority.toString(), core: core.toString(), handle: handle.toString()});
+  waitPolls.set(handle, 0);
+  return 0n;
+});
+def(0x5101, handle => 0n);                                   // svcStartThread (#0x09)
+def(0x5102, () => 0n);                                       // svcExitThread (#0x0A)
+def(0x5103, (out, handles, count, timeoutNs) => {            // svcWaitSynchronization (#0x18)
+  const handle = read64(handles) & 0xffffffffn;
+  const polls = (waitPolls.get(handle) || 0) + 1;
+  waitPolls.set(handle, polls);
+  waits.push({handle: handle.toString(), timeoutNs: timeoutNs.toString(), poll: polls});
+  if (polls === 1) return 0xea01n; // kernel wait timeout — the host polls again
+  write64(out, 0n);             // signaled index 0
+  return 0n;
+});
+def(0x5104, (out, handle) => {write64(out, 43n); return 0n;}); // svcGetThreadPriority (#0x0C)
+def(0x5105, (outIdeal, outMask, handle) => {                  // svcGetThreadCoreMask (#0x0E)
+  write64(outIdeal, 2n); write64(outMask, 0x4n); return 0n;
+});
+def(0x5106, handle => 0n);                                   // svcCloseHandle (#0x16)
+
+// Fake nn::os thread-manager list for op 15 (kit rawSvc.managerList layout:
+// manager = read64(sdk + global) + 0xF0; sentinel manager+0x1D0; node+0x1B0 =
+// a real kernel handle). One live node with handle 0x6000.
+{
+  const globalCell = sdk_base + 0x6000n, managerPtr = sdk_base + 0x8000n;
+  const manager = managerPtr + 0xf0n, sentinel = manager + 0x1d0n, node = sdk_base + 0x7800n;
+  write64(globalCell, managerPtr);
+  write64(sentinel, node);      // list head -> first node
+  write64(node, sentinel);      // node.next -> back to the sentinel
+  write64(node + 0x1b0n, 0x6000n); // node handle (real-looking kernel handle)
+}
 function call_rop(fn, ...args) {
   const impl = natives.get(BigInt(fn));
   if (!impl) throw Error('sim call_rop: no native at 0x' + BigInt(fn).toString(16));
@@ -152,7 +200,7 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 // port-based path would double-fire while idle and hand the next test a stale
 // snapshot.
 function respondInspect() {
-  parentPort.postMessage({type: 'inspect', allocations, nativeCalls, queries, sleeps, threads, joins});
+  parentPort.postMessage({type: 'inspect', allocations, nativeCalls, queries, sleeps, threads, joins, rawThreads, waits});
 }
 function serviceInspect() {
   if (Atomics.load(H, 10) === 1) {Atomics.store(H, 10, 0); respondInspect();}

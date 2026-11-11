@@ -32,10 +32,12 @@
 //   offset 88  u64  svcSleepThread         (absolute; 0 = unknown)
 //   offset 96  32 bytes reserved, zero
 //   then a 256-byte JSON trailer, NUL-padded: the console's known-offsets dict
-//   {"svc":{...},"sdk_offsets":{...}} (module-relative offsets, exactly the
-//   same keys/groups as offsets/civ7-100.json; null = not known on-console).
-//   The host cross-checks it against its own table (lib/connection.cjs +
-//   lib/offsets.cjs); svc/sdk_offsets can also arrive later via op 11.
+//   {"svc":{...},"sdk_offsets":{...}} (module-relative offsets, same
+//   keys/groups as offsets/civ7-100.json). Only NON-NULL leaves are included
+//   (the dict must fit 256 bytes; absent = unknown on-console). The host's
+//   authoritative copy is its offsets file and it cross-checks what is here
+//   (lib/connection.cjs + lib/offsets.cjs); svc/sdk_offsets can also arrive
+//   later via op 11.
 //
 // Request (host -> console):
 //   u32 magic = 0x43495631 (wire bytes read "1VIC")
@@ -88,6 +90,46 @@
 //              them here; the reply echoes the merged dict, capped). Only
 //              whole-number/null values are accepted; unknown groups/keys
 //              are ignored.
+//  12 THREAD_CREATE_RAW : { u64 jbPtr; u64 stackTop; u32 priority; u32 core }
+//              (24 bytes) -> { u64 handle }.
+//              call_rop(svcCreateThread, &slot, longjmp, jbPtr, stackTop,
+//              priority, core) then svcStartThread(handle). The raw-kernel
+//              thread path: nn::os::CreateThread HANGS and pthread_create
+//              silently no-ops on Civ 7 1.0.0 (civswitch-kit
+//              thread-code.json, hardware-qualified 2026-11-02), so wave
+//              workers must be created with raw svcCreateThread. priority
+//              and a mask-valid core come from op 15. Entry is longjmp with
+//              the jmp_buf/forged-chain pointer as its argument — the exact
+//              entry their hardware probe validated on raw threads.
+//              A rejected create (e.g. 0xE001 bad priority/core) returns
+//              status 2 with the code in the message so the host can retry
+//              another core. Needs OFFSETS.svc.{create_thread,start_thread}
+//              + sdk_offsets.longjmp. NOTE: exit inside worker chains must
+//              be the svc #0x0A wrapper — svc #0x07 is svcExitProcess and
+//              kills the game.
+//  13 THREAD_WAIT : { u64 handle; u64 timeoutNs } (16 bytes)
+//              -> { u64 result; u64 index } — single-shot
+//              svcWaitSynchronization(&index, &handle, 1, timeoutNs).
+//              result 0 = signaled (index says which), 0xEA01 = kernel
+//              wait timeout (poll again); other codes are the host's to
+//              judge. Single-shot by design: the host drives the poll loop
+//              (10 ms) so the console JS thread stays free. Needs
+//              OFFSETS.svc.wait_synchronization.
+//  14 THREAD_CLOSE : { u64 handle } -> { u64 result } — svcCloseHandle on a
+//              raw thread handle. Needs OFFSETS.svc.close_handle.
+//  15 THREAD_SCHED_BORROW : {} -> { u64 priority; u64 coreMask; u64 manager;
+//              u64 nodes } — walk the nn::os thread-manager list on-console
+//              (manager = read64(sdk + sdk_offsets.thread_manager_global) +
+//              0xF0; sentinel manager+0x1D0; node+0x1B0 holds a real kernel
+//              thread handle) and query the first live node with
+//              svcGetThreadPriority / svcGetThreadCoreMask. Raw threads have
+//              no ThreadType, so a valid priority (observed 43/44/59/28) and
+//              the usable-core mask are BORROWED from a live game thread —
+//              the kernel query is authoritative; in-struct priority fields
+//              are not. Nodes are guarded (plausible+aligned, dedupe, cap
+//              32, mapping check via QUERY when the offset is known). Needs
+//              OFFSETS.svc.{get_thread_priority,get_thread_core_mask} +
+//              sdk_offsets.thread_manager_global.
 //
 // Status codes: 0 OK, 1 op-unavailable (offset unknown), 2 op-failed (native
 // call returned an error), 3 bad request, 4 internal error.
@@ -122,13 +164,20 @@
                 query_memory: null,             // svc #0x06 wrapper
                 connect_to_named_service: null, // svc #0x1F wrapper
                 send_sync_request: null,        // svc #0x21 wrapper
-                sleep_thread: null              // svc #0x0B wrapper
+                sleep_thread: null,             // svc #0x0B wrapper
+                close_handle: null,             // svc #0x16 wrapper
+                wait_synchronization: null,     // svc #0x18 wrapper
+                create_thread: null,            // svc #0x08 wrapper (raw threads)
+                start_thread: null,             // svc #0x09 wrapper
+                get_thread_priority: null,      // svc #0x0C wrapper
+                get_thread_core_mask: null      // svc #0x0E wrapper
             },
             sdk_offsets: {
                 longjmp: null,
                 pthread_create: null,
                 pthread_join: null,
-                pthread_exit: null
+                pthread_exit: null,
+                thread_manager_global: null     // nn::os thread-manager global (op 15)
             },
             modules: {
                 main: { size: null },
@@ -138,13 +187,19 @@
     };
 
     const OP = { PING: 1, CALL: 2, READ: 3, WRITE: 4, QUERY: 5, ALLOC: 6, FREE: 7,
-        THREAD_CREATE: 8, THREAD_JOIN: 9, SLEEP: 10, UPD_OFFSETS: 11 };
+        THREAD_CREATE: 8, THREAD_JOIN: 9, SLEEP: 10, UPD_OFFSETS: 11,
+        THREAD_CREATE_RAW: 12, THREAD_WAIT: 13, THREAD_CLOSE: 14, THREAD_SCHED_BORROW: 15 };
     const STATUS = { OK: 0, UNAVAILABLE: 1, FAILED: 2, BAD_REQUEST: 3, INTERNAL: 4 };
     const HELLO_MAGIC = 0x31564943n;   // LE bytes on the wire read "CIV1"
     const REQUEST_MAGIC = 0x43495631n; // LE bytes on the wire read "1VIC"
     const HELLO_BYTES = 128, TRAILER_BYTES = 256;
     const ADDR_MIN = 0x1000n;          // below this no mapping ever exists
     const ADDR_MAX = 1n << 47n;        // Switch 2 userland never reaches here
+    // civswitch-kit thread-code.json rawSvc.managerList layout (hardware-
+    // validated on Civ 7 1.0.0): manager = read64(sdk + global) + 0xF0, the
+    // intrusive list sentinel sits at manager+0x1D0, and node+0x1B0 holds a
+    // real kernel thread handle usable with the priority/core-mask SVCs.
+    const MANAGER_LAYOUT = { bias: 0xf0n, sentinel: 0x1d0n, handleOffset: 0x1b0n, maxNodes: 32 };
 
     // ---- request validation helpers (status 3 on violation) ---------------
     function bad(message) {
@@ -315,11 +370,21 @@
             ...le64(svc.query_memory), ...le64(svc.send_sync_request),
             ...le64(svc.connect_to_named_service), ...le64(svc.sleep_thread)];
         while (h.length < HELLO_BYTES) h.push(0);
-        // Trailer: the console's known-offsets dict. Kept to the groups the
-        // console itself consumes so it always fits the 256-byte budget (the
-        // host's authoritative copy is offsets/civ7-100.json on its side).
-        const dict = JSON.stringify({ svc: CONFIG.OFFSETS.svc, sdk_offsets: CONFIG.OFFSETS.sdk_offsets });
-        if (dict.length > TRAILER_BYTES) throw new Error("civshim: offsets JSON exceeds trailer");
+        // Trailer: the console's known-offsets dict — NON-NULL leaves only.
+        // If even that exceeds the 256-byte budget (a fully-populated dict
+        // after an op-11 upload), send empty groups: the host's authoritative
+        // copy is offsets/civ7-100.json on its side and it re-uploads the
+        // console-consumed groups with op 11 right after connecting anyway.
+        const known = {};
+        for (const group of ["svc", "sdk_offsets"])
+            known[group] = Object.fromEntries(
+                Object.entries(CONFIG.OFFSETS[group] || {})
+                    .filter(([, value]) => value !== null && value !== undefined));
+        let dict = JSON.stringify(known);
+        if (dict.length > TRAILER_BYTES) {
+            await log("civshim: known-offsets dict (" + dict.length + " B) exceeds the 256 B trailer — sending empty groups");
+            dict = JSON.stringify({svc: {}, sdk_offsets: {}});
+        }
         const t = [];
         for (let i = 0; i < dict.length; i++) t.push(dict.charCodeAt(i) & 0xff);
         while (t.length < TRAILER_BYTES) t.push(0);
@@ -423,6 +488,132 @@
         requireSvc("sleep_thread", "SLEEP");
         call_rop(svc.sleep_thread, takeU64(payload, 0));
         return [];
+    }
+
+    // ---- raw-svc thread ops (civswitch-kit hardware recipe; see the header) ----
+    let rawSlot = 0n;
+    function requireSdkFn(name, what) {
+        if (!sdkFn[name]) throw Object.assign(
+            Error("civshim: " + what + " needs OFFSETS.sdk_offsets." + name +
+                " (fill from offsets/civ7-100.json — bake it in above or send op 11 UPD_OFFSETS)"),
+            { status: STATUS.UNAVAILABLE });
+    }
+
+    async function handleThreadCreateRaw(fd, payload) {
+        // { u64 jbPtr; u64 stackTop; u32 priority; u32 core }
+        //   -> { u64 handle; u64 createResult; u64 startResult } (24 bytes).
+        // Kernel rejections (0xE001 priority/core) come back as payload values
+        // with status OK — the host retries another borrowed core on them; only
+        // protocol-shaped problems are errors.
+        exactLen(payload, 24, "THREAD_CREATE_RAW");
+        requireSvc("create_thread", "THREAD_CREATE_RAW");
+        requireSvc("start_thread", "THREAD_CREATE_RAW");
+        requireSdkFn("longjmp", "THREAD_CREATE_RAW");
+        const jbPtr = plausible(takeU64(payload, 0), "THREAD_CREATE_RAW jmp_buf");
+        const stackTop = takeU64(payload, 8);
+        if (stackTop < ADDR_MIN || stackTop >= ADDR_MAX || stackTop % 0x1000n !== 0n)
+            throw bad("THREAD_CREATE_RAW stackTop 0x" + stackTop.toString(16) +
+                " must be a page-aligned plausible guest address");
+        const priority = takeU32(payload, 16), core = takeU32(payload, 20);
+        if (priority === 0 || priority >= 64)
+            throw bad("THREAD_CREATE_RAW priority " + priority + " outside 1..63 (borrow one via op 15)");
+        if (core > 255) throw bad("THREAD_CREATE_RAW core " + core + " outside 0..255");
+        if (rawSlot === 0n) {
+            rawSlot = malloc(16);
+            if (rawSlot === 0n) throw Object.assign(Error("civshim: raw slot malloc failed"), { status: STATUS.FAILED });
+            store64(rawSlot, 0n);
+        }
+        const createResult = call_rop(svc.create_thread, rawSlot, sdkFn.longjmp, jbPtr,
+            stackTop, BigInt(priority), BigInt(core));
+        if (createResult !== 0n) return [...le64(0n), ...le64(createResult), ...le64(0n)];
+        const handle = read64(rawSlot) & 0xffffffffn;
+        if (handle === 0n || handle >= 0xffff8000n)
+            throw Object.assign(Error("civshim: invalid raw thread handle 0x" + handle.toString(16)), { status: STATUS.FAILED });
+        const startResult = call_rop(svc.start_thread, handle);
+        if (startResult !== 0n) {
+            try { call_rop(svc.close_handle, handle); } catch (_) {}
+            return [...le64(0n), ...le64(0n), ...le64(startResult)];
+        }
+        return [...le64(handle), ...le64(0n), ...le64(0n)];
+    }
+
+    async function handleThreadWait(fd, payload) {
+        // { u64 handle; u64 timeoutNs } -> { u64 result; u64 index }, single-shot.
+        exactLen(payload, 16, "THREAD_WAIT");
+        requireSvc("wait_synchronization", "THREAD_WAIT");
+        const handle = takeU64(payload, 0);
+        if (handle === 0n || handle >= 0xffff8000n)
+            throw bad("THREAD_WAIT handle 0x" + handle.toString(16) + " is not a kernel thread handle");
+        const timeoutNs = takeU64(payload, 8);
+        const out = staging + 0xa00n, handles = staging + 0xa80n;
+        store64(out, 0n);
+        store64(handles, handle); // u32 handle in the first slot; padding zero
+        const result = call_rop(svc.wait_synchronization, out, handles, 1n, timeoutNs);
+        const index = read64(out) & 0xffffffffn;
+        return [...le64(result), ...le64(index)];
+    }
+
+    async function handleThreadClose(fd, payload) {
+        exactLen(payload, 8, "THREAD_CLOSE");
+        requireSvc("close_handle", "THREAD_CLOSE");
+        const handle = takeU64(payload, 0);
+        if (handle === 0n || handle >= 0xffff8000n)
+            throw bad("THREAD_CLOSE handle 0x" + handle.toString(16) + " is not a kernel thread handle");
+        const result = call_rop(svc.close_handle, handle);
+        return [...le64(result)];
+    }
+
+    async function handleThreadSchedBorrow(fd, payload) {
+        // Walk the nn::os manager list on-console; borrow priority + core mask
+        // from the first node whose kernel handle answers the SVCs. Guards:
+        // plausible+aligned nodes, a dedupe set, a node cap, and — when the
+        // query_memory wrapper is known — a mapping check before each read.
+        exactLen(payload, 0, "THREAD_SCHED_BORROW");
+        requireSvc("get_thread_priority", "THREAD_SCHED_BORROW");
+        requireSvc("get_thread_core_mask", "THREAD_SCHED_BORROW");
+        requireSdkFn("thread_manager_global", "THREAD_SCHED_BORROW");
+        const out = staging + 0xb00n;
+        const covered = async address => {
+            if (!svc.query_memory) return true; // alignment+dedupe guards only
+            const result = call_rop(svc.query_memory, staging + 0x800n, staging + 0x900n, address);
+            if (result !== 0n) return false;
+            const base = read64(staging + 0x800n), size = read64(staging + 0x808n);
+            return address >= base && address + 0x608n <= base + size;
+        };
+        const manager = read64(sdk_base + BigInt(CONFIG.OFFSETS.sdk_offsets.thread_manager_global)) + MANAGER_LAYOUT.bias;
+        if (manager < ADDR_MIN || manager >= ADDR_MAX || manager % 8n !== 0n)
+            throw Object.assign(Error("civshim: implausible thread-manager pointer 0x" + manager.toString(16)), { status: STATUS.FAILED });
+        if (!(await covered(manager))) throw Object.assign(Error("civshim: manager mapping check failed"), { status: STATUS.FAILED });
+        const sentinel = manager + MANAGER_LAYOUT.sentinel;
+        let node = read64(sentinel);
+        const seen = new Set();
+        let nodes = 0;
+        for (let count = 0; node !== sentinel && count < MANAGER_LAYOUT.maxNodes; count++) {
+            if (node < ADDR_MIN || node >= ADDR_MAX || node % 8n !== 0n || seen.has(node.toString()))
+                throw Object.assign(Error("civshim: invalid or cyclic manager-list node 0x" + node.toString(16)), { status: STATUS.FAILED });
+            seen.add(node.toString());
+            nodes++;
+            if (!(await covered(node)))
+                throw Object.assign(Error("civshim: node mapping check failed at 0x" + node.toString(16)), { status: STATUS.FAILED });
+            const handle = (read64(node + MANAGER_LAYOUT.handleOffset)) & 0xffffffffn;
+            const next = read64(node);
+            if (handle > 0n && handle < 0xffff8000n) {
+                const prioResult = call_rop(svc.get_thread_priority, out, handle, 0n);
+                if (prioResult === 0n) {
+                    const priority = read64(out) & 0xffffffffn;
+                    if (priority > 0n && priority < 64n) {
+                        const maskResult = call_rop(svc.get_thread_core_mask, out, out + 8n, handle);
+                        if (maskResult === 0n) {
+                            const coreMask = read64(out + 8n);
+                            if (coreMask !== 0n)
+                                return [...le64(priority), ...le64(coreMask), ...le64(manager), ...le64(BigInt(nodes))];
+                        }
+                    }
+                }
+            }
+            node = next;
+        }
+        throw Object.assign(Error("civshim: no borrowable thread scheduling found (" + nodes + " nodes)"), { status: STATUS.FAILED });
     }
 
     async function handleUpdOffsets(fd, payload) {
@@ -578,6 +769,18 @@
                         break;
                     case OP.UPD_OFFSETS:
                         await sendResponse(fd, op, id, STATUS.OK, await handleUpdOffsets(fd, payload));
+                        break;
+                    case OP.THREAD_CREATE_RAW:
+                        await sendResponse(fd, op, id, STATUS.OK, await handleThreadCreateRaw(fd, payload));
+                        break;
+                    case OP.THREAD_WAIT:
+                        await sendResponse(fd, op, id, STATUS.OK, await handleThreadWait(fd, payload));
+                        break;
+                    case OP.THREAD_CLOSE:
+                        await sendResponse(fd, op, id, STATUS.OK, await handleThreadClose(fd, payload));
+                        break;
+                    case OP.THREAD_SCHED_BORROW:
+                        await sendResponse(fd, op, id, STATUS.OK, await handleThreadSchedBorrow(fd, payload));
                         break;
                     default:
                         await sendResponse(fd, op, id, STATUS.BAD_REQUEST, []);

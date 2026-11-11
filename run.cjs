@@ -26,12 +26,18 @@
 //                     loopback PORT (default: ephemeral, printed once);
 //                     subsystems attach per stage progress, missing ones
 //                     degrade to coded E_CONFIG errors (docs/SHELL.md)
-//   --worker B        ropchain (default) | frames — worker backend
+//   --worker B        ropchain (default) | frames | rawsvc — worker backend
+//                     (rawsvc = the civswitch-kit raw svcCreateThread path,
+//                     the hardware-qualified mode for Civ 7 1.0.0)
 //   --donor M         save (default) | tmp — donor/scratch mount source
+//   --deploy          push the offsets-baked civshim carrier through the
+//                     CivSwitch :9026 loader before connecting
+//                     (engine/carrier/civ7js/; pair with --loader-port N)
 //   --check           M1 transport verification: PING, QUERY, ALLOC, WRITE,
 //                     READ-back, CALL (svcSleepThread 1ms) — then exit
-//   --check-workers N M2 verification: N ropchain workers (default 4) running
+//   --check-workers N M2 verification: N workers (default 4) running
 //                     sleep+memcpy chains in parallel, joined and verified
+//                     (--worker rawsvc exercises civshim ops 12-15)
 //   --version         print the BarbarismJB version and exit
 //
 // DO NOT UPDATE THE CONSOLE PAST 23.0.1 (23.5.0 patches the fs bug).
@@ -59,18 +65,22 @@ const log = createLog('barbarism');
 
 const USAGE = 'BarbarismJB ' + VERSION + '\n' +
   'Usage: node run.cjs [--port N] [--stage acquire|pid|launch|demo|dump|all]\n' +
-  '  [--rpc] [--dump-firmware] [--worker ropchain|frames] [--donor save|tmp]\n' +
-  '  [--check | --check-workers N] [--version] console-IP\n' +
+  '  [--rpc] [--dump-firmware] [--worker ropchain|frames|rawsvc] [--donor save|tmp]\n' +
+  '  [--deploy [--loader-port N]] [--check | --check-workers N] [--version] console-IP\n' +
   '\n' +
-  '  Prerequisites: Civ 7 running with the CivSwitch :9026 loader armed, and\n' +
-  '  payloads/civshim.js sent through it (python3 send_js.py <ip> payloads/civshim.js).\n' +
-  '  offsets/civ7-100.json must be filled in from the M0 bootstrap.\n' +
+  '  Prerequisites: Civ 7 running with the CivSwitch :9026 loader armed. With\n' +
+  '  --deploy the host pushes the offsets-baked civshim carrier through the\n' +
+  '  loader itself (engine/carrier/civ7js/); without it, send payloads/civshim.js\n' +
+  '  manually first (python3 send_js.py <ip> payloads/civshim.js).\n' +
+  '  offsets/civ7-100.json must be filled in from the M0 bootstrap (seed it with\n' +
+  '  engine/carrier/civ7js/import-civswitch-offsets.cjs — docs/CIVSWITCH-INTEGRATION.md).\n' +
   '  Switch 2 on firmware 23.0.1 only. Never update past 23.0.1.';
 
 function parseArgs(args) {
   const options = {port: CONSOLE_PORT, stage: 'all', rpc: false, dumpFirmware: false,
     shell: false, shellPort: undefined,
-    worker: 'ropchain', donor: 'save', check: false, checkWorkers: 0, host: null};
+    worker: 'ropchain', donor: 'save', check: false, checkWorkers: 0, host: null,
+    deploy: false, loaderPort: 9026};
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
     if (arg === '--help' || arg === '-h') {options.help = true; continue;}
@@ -107,8 +117,15 @@ function parseArgs(args) {
     }
     if (arg === '--worker') {
       const value = args[++i];
-      if (!['ropchain', 'frames'].includes(value)) throw fail('E_USAGE', '--worker must be ropchain|frames');
+      if (!['ropchain', 'frames', 'rawsvc'].includes(value)) throw fail('E_USAGE', '--worker must be ropchain|frames|rawsvc');
       options.worker = value;
+      continue;
+    }
+    if (arg === '--deploy') {options.deploy = true; continue;}
+    if (arg === '--loader-port') {
+      const value = Number(args[++i]);
+      if (!Number.isInteger(value) || value < 1024 || value > 65535) throw fail('E_USAGE', '--loader-port must be 1024..65535');
+      options.loaderPort = value;
       continue;
     }
     if (arg === '--donor') {
@@ -290,7 +307,10 @@ async function transportCheck(civshim, resolved) {
 
 // barbarism: M2 worker verification — N ropchain workers, each running a
 // sleep+memcpy chain twice, created in parallel, joined, results checked.
-async function workerCheck(civshim, resolved, table, count) {
+// With --worker rawsvc the same chains launch through the civswitch-kit raw
+// svcCreateThread path (civshim ops 12-15) — the hardware-qualified mode for
+// Civ 7 1.0.0, where pthread_create silently no-ops.
+async function workerCheck(civshim, resolved, table, count, workerBackend = 'ropchain') {
   const {buildRop} = require('./engine/shared/frames.cjs');
   const {parseJmpBuf} = offsets;
   const jmpBuf = parseJmpBuf(table.jmp_buf);
@@ -300,6 +320,19 @@ async function workerCheck(civshim, resolved, table, count) {
   const sdk = Number(resolved.sdk);
   if (!memcpy) throw Error('--check-workers needs sdk_offsets.memcpy');
   if (!sleep) throw Error('--check-workers needs svc.sleep_thread');
+  const rawsvc = workerBackend === 'rawsvc';
+  const RAW_STACK_BYTES = 0x14000; // civswitch-kit target.civ7.json thread.stackBytes
+  let scheduling = null;
+  if (rawsvc) {
+    if (!Number(resolved.svc.exit_thread)) throw Error('rawsvc needs svc.exit_thread (svc #0x0A wrapper)');
+    scheduling = await civshim.threadSchedBorrow();
+    if (!(scheduling.priority > 0 && scheduling.priority < 64) || scheduling.coreMask === 0n)
+      throw Error('THREAD_SCHED_BORROW returned an unusable scheduling (priority ' + scheduling.priority + ')');
+    const cores = [];
+    for (let bit = 0n; bit < 64n; bit++) if ((BigInt(scheduling.coreMask) >> bit) & 1n) cores.push(Number(bit));
+    scheduling.cores = cores;
+    console.log('  THREAD_SCHED_BORROW ok (priority ' + scheduling.priority + ', cores [' + cores + '], ' + scheduling.nodes + ' nodes)');
+  }
   const pattern = crypto.randomBytes(64);
   const workers = [];
   for (let index = 0; index < count; index++) {
@@ -313,21 +346,55 @@ async function workerCheck(civshim, resolved, table, count) {
       {function: sleep, args: [2000000n, 0n, 0n, 0n], name: 'sleep2'},
       {function: memcpy, args: [base + 0x4000 + index * 64 + 0x800, src, 64, 0], name: 'copy2'}
     ];
-    const {frame, proof} = buildRop(base, {sdk, sdkSize: table.modules.sdk.size || 0x8000000,
-      sdkFn: resolved.sdkFn}, calls, jmpBuf, gadgets);
+    const liveArg = {sdk, sdkSize: table.modules.sdk.size || 0x8000000, sdkFn: resolved.sdkFn};
+    if (rawsvc) liveArg.workerExit = Number(resolved.svc.exit_thread);
+    const {frame, proof} = buildRop(base, liveArg, calls, jmpBuf, gadgets);
     await civshim.write(base, frame);
-    workers.push({index, base, src, calls, proof});
+    let stack = 0;
+    if (rawsvc) {
+      stack = await civshim.alloc(RAW_STACK_BYTES);
+      if (!(stack > 0) || stack % 4096) throw Error('raw stack ALLOC failed');
+    }
+    workers.push({index, base, src, stack, calls, proof});
   }
-  console.log('  built ' + workers.length + ' ropchain workers (jmp_buf ' + table.jmp_buf.size + 'B, mangled=' + table.jmp_buf.mangled + ')');
+  console.log('  built ' + workers.length + ' ' + workerBackend + ' workers (jmp_buf ' + table.jmp_buf.size + 'B, mangled=' + table.jmp_buf.mangled + ')');
   const created = [];
   for (const worker of workers) {
-    const thread = await civshim.threadCreate(worker.base);
-    if (!(thread > 0)) throw Error('THREAD_CREATE failed for worker ' + worker.index);
-    created.push({...worker, thread});
+    if (rawsvc) {
+      let handle = 0;
+      for (const core of scheduling.cores) {
+        const reply = await civshim.threadCreateRaw(worker.base, worker.stack + RAW_STACK_BYTES,
+          scheduling.priority, core);
+        if (reply.handle) {handle = reply.handle; break;}
+        if (reply.createResult !== 0xe001)
+          throw Error('svcCreateThread failed 0x' + reply.createResult.toString(16) + ' for worker ' + worker.index);
+      }
+      if (!(handle > 0)) throw Error('svcCreateThread rejected every borrowed core (worker ' + worker.index + ')');
+      created.push({...worker, thread: handle});
+    } else {
+      const thread = await civshim.threadCreate(worker.base);
+      if (!(thread > 0)) throw Error('THREAD_CREATE failed for worker ' + worker.index);
+      created.push({...worker, thread});
+    }
   }
-  console.log('  THREAD_CREATE x' + created.length + ' ok; joining...');
+  console.log(rawsvc ? '  THREAD_CREATE_RAW x' + created.length + ' ok; joining (svcWaitSynchronization poll)...'
+                    : '  THREAD_CREATE x' + created.length + ' ok; joining...');
   for (const worker of created) {
-    await civshim.threadJoin(worker.thread);
+    if (rawsvc) {
+      const deadline = Date.now() + 30000;
+      for (;;) {
+        const wait = await civshim.threadWait(worker.thread, 0n);
+        if (wait.result === 0) {if (wait.index !== 0) throw Error('wait signaled a different handle'); break;}
+        if (wait.result !== 59905)
+          throw Error('svcWaitSynchronization 0x' + wait.result.toString(16) + ' (worker ' + worker.index + ')');
+        if (Date.now() > deadline) throw Error('raw worker ' + worker.index + ' did not terminate');
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+      const closed = await civshim.threadClose(worker.thread);
+      if (closed !== 0) throw Error('svcCloseHandle 0x' + closed.toString(16));
+    } else {
+      await civshim.threadJoin(worker.thread);
+    }
     const raw = await civshim.read(worker.base + worker.proof.resultsOffset, worker.proof.resultOffsets.length * 8);
     const values = worker.proof.resultOffsets.map((_, i) => raw.readBigUInt64LE(i * 8));
     if (values.some(value => value === 0xfedcba9876543210n))
@@ -337,10 +404,11 @@ async function workerCheck(civshim, resolved, table, count) {
     if (!copied.equals(pattern) || !copied2.equals(pattern))
       throw Error('worker ' + worker.index + ' memcpy output differs');
   }
-  console.log('  THREAD_JOIN x' + created.length + ' ok; all sleep/memcpy results stored and verified');
+  console.log('  join x' + created.length + ' ok; all sleep/memcpy results stored and verified');
   for (const worker of created) {
     await civshim.free(worker.base);
     await civshim.free(worker.src);
+    if (worker.stack) await civshim.free(worker.stack);
   }
   return true;
 }
@@ -367,7 +435,7 @@ async function main(args = process.argv.slice(2)) {
   try {
     table = offsets.load(PROJECT); // fails loudly on missing REQUIRED entries
   } catch (error) {
-    if (!options.check && !options.checkWorkers) throw error;
+    if (!options.check && !options.checkWorkers && !options.deploy) throw error;
     log.warn('offsets table unusable — continuing in transport-check mode.');
     log.warn('  (' + String(error.message).split('\n')[0] + ')');
     log.warn('  QUERY / SLEEP / THREAD checks will report unavailable; PING/CALL/READ/WRITE/ALLOC still verify.');
@@ -375,6 +443,23 @@ async function main(args = process.argv.slice(2)) {
       gadgets: {}, pins: {}}, file: null, warnings: [], workerReady: false};
   }
   for (const warning of table.warnings) log.warn(warning.replace(/^offsets warning: /, ''));
+
+  // barbarism: --deploy — push the offsets-baked civshim carrier through the
+  // CivSwitch :9026 loader before connecting (engine/carrier/civ7js/). Deploying
+  // alone exits after the shim's "listening" line; combine with --check /
+  // --check-workers to deploy-and-verify in one command.
+  if (options.deploy) {
+    const {deployCarrier} = require('./engine/carrier/civ7js/deploy.cjs');
+    const deployed = await deployCarrier({project: PROJECT, offsetsTable: table.table,
+      host: options.host, loaderPort: options.loaderPort, shimPort: options.port,
+      log: line => console.log('  deploy: ' + line)});
+    if (!options.check && !options.checkWorkers) {
+      console.log('Deployed ' + deployed.carrier + ' — civshim is listening on :' + options.port + '.');
+      console.log('Continue with: node run.cjs --check ' + options.host);
+      return {platform: 2, version: VERSION, deployed: deployed.carrier, verified: true,
+        console: options.host, port: options.port};
+    }
+  }
 
   const workspace = path.join(PROJECT, 'runs');
   await fs.mkdir(workspace, {recursive: true, mode: 0o700});
@@ -413,8 +498,13 @@ async function main(args = process.argv.slice(2)) {
     {
       // Trim to the groups/keys the console itself consumes (payloads/civshim.js)
       // so the console's merged dict stays exactly its documented shape.
-      const CONSOLE_SVC = ['query_memory', 'connect_to_named_service', 'send_sync_request', 'sleep_thread'];
-      const CONSOLE_SDK = ['longjmp', 'pthread_create', 'pthread_join', 'pthread_exit', 'memset', 'memcpy'];
+      const CONSOLE_SVC = ['query_memory', 'connect_to_named_service', 'send_sync_request', 'sleep_thread',
+        // barbarism: raw-svc thread surface (civshim ops 12-15; the civswitch-kit
+        // hardware recipe — docs/CIVSWITCH-INTEGRATION.md §2c).
+        'close_handle', 'wait_synchronization', 'create_thread', 'start_thread',
+        'get_thread_priority', 'get_thread_core_mask'];
+      const CONSOLE_SDK = ['longjmp', 'pthread_create', 'pthread_join', 'pthread_exit', 'memset', 'memcpy',
+        'thread_manager_global'];
       const pick = (group, keys) => Object.fromEntries(keys.map(key => [key, group[key] ?? null]));
       const modules = {};
       for (const name of ['main', 'sdk'])
@@ -448,7 +538,7 @@ async function main(args = process.argv.slice(2)) {
       return result;
     }
     if (options.checkWorkers) {
-      await workerCheck(bridge.civshim, resolvedOffsets, table.table, options.checkWorkers);
+      await workerCheck(bridge.civshim, resolvedOffsets, table.table, options.checkWorkers, options.worker);
       result.workerCheck = {workers: options.checkWorkers};
       result.verified = true;
       console.log('M2 worker check passed.');

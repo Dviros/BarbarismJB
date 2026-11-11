@@ -74,7 +74,14 @@ else
   record "civshim simulation" 1
 fi
 
-# 3b) Shell layer simulation.
+# 3b) CivSwitch carrier layer (loader client, carrier baker, kit offsets import).
+if run_step 120 node tests/civ7js-carrier-test.cjs; then
+  record "civ7js carrier layer" 0
+else
+  record "civ7js carrier layer" 1
+fi
+
+# 3c) Shell layer simulation.
 if run_step 120 node tests/shell-sim.cjs; then
   record "shell simulation" 0
 else

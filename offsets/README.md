@@ -4,6 +4,25 @@ Everything the exploit engine needs about Civ 7's `main` and `sdk` modules is
 produced by one console session plus offline analysis. `civ7-100.template.json`
 is the schema; the filled copy becomes `civ7-100.json`.
 
+## 0. Seed from the civswitch-kit first (before any console work)
+
+`node engine/carrier/civ7js/import-civswitch-offsets.cjs <civswitch-kit-root>`
+imports **38 hardware-validated values** for this exact cartridge build from
+the public CN kit (`gitee.com/mza1010/civswitch-kit`, GPL-2.0; provenance per
+leaf in the emitted `_civswitch.imported` list). The game statically links its
+nnSdk, so `sdk`-module offsets are cartridge-build constants — firmware-
+independent — and carry to our 23.0.0 console as-is. After seeding, M0 shrinks
+to **verification** of these plus discovery of the explicit remainder
+(`_civswitch.todo`): `modules.*.first_page_sha256` pins, `modules.main.size`,
+`svc.connect_to_named_service` (the kit used `nn::sm::GetServiceHandle`
+sdk+0x14CC90 instead), the `timing` second-module question (or adopt the
+kit's measured mode), the `mounts` accessor layout constants, and four
+`gadgets` entries. The kit's Civ7-BC fs geometry (pin cost 6960, heap jitter
+192, writeSize 0x800000, probeReadSize 0x10000, fill segment 63, 0xEA01 wait
+timeout, sdk CRC 157086863) is recorded in `_civswitchGeometry` and consumed
+by the probe knobs / the runbook. Full analysis:
+`docs/CIVSWITCH-INTEGRATION.md` §2d + §4.
+
 ## Ground-truth svc numbers
 
 From `repos/ns2jb/engine/switch2/ro/payload/start.S` (Switch 2, firmware

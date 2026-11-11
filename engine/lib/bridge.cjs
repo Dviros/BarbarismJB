@@ -19,7 +19,8 @@ const http = require('node:http');
 const {fail} = require('../shared/errors.cjs');
 
 const OP = {PING: 1, CALL: 2, READ: 3, WRITE: 4, QUERY: 5, ALLOC: 6, FREE: 7,
-  THREAD_CREATE: 8, THREAD_JOIN: 9, SLEEP: 10, UPD_OFFSETS: 11};
+  THREAD_CREATE: 8, THREAD_JOIN: 9, SLEEP: 10, UPD_OFFSETS: 11,
+  THREAD_CREATE_RAW: 12, THREAD_WAIT: 13, THREAD_CLOSE: 14, THREAD_SCHED_BORROW: 15};
 const REQUEST_MAGIC = 0x43495631; // wire bytes read "1VIC"
 const RESPONSE_BYTES = 20;        // magic, op|0x80000000, id, payloadLen, status
 const MAX_STREAM = 0x80000;       // one civshim READ/WRITE per bridge request
@@ -182,6 +183,64 @@ class Civshim {
     return this.request(OP.THREAD_JOIN, u64le(guestAddress(thread, 'thread handle')));
   }
 
+  // barbarism: raw-svc thread surface (civswitch-kit hardware recipe — see
+  // payloads/civshim.js ops 12-15 and docs/CIVSWITCH-INTEGRATION.md §2c).
+  // Raw kernel-thread creation: nn::os::CreateThread hangs and pthread_create
+  // silently no-ops on Civ 7 1.0.0, so wave workers enter via
+  // svcCreateThread(entry=longjmp, arg=jbPtr, stackTop, priority, core).
+  // Resolves {handle, createResult, startResult}: handle non-zero = live
+  // thread; createResult 0xE001 means the kernel rejected priority/core —
+  // retry another borrowed core.
+  threadCreateRaw(jbPtr, stackTop, priority, core) {
+    const payload = Buffer.concat([
+      u64le(guestAddress(jbPtr, 'raw-thread jmp_buf pointer')),
+      u64le(guestAddress(stackTop, 'raw-thread stack top')),
+      (() => {const b = Buffer.alloc(8); b.writeUInt32LE(priority); b.writeUInt32LE(core, 4); return b;})()
+    ]);
+    return this.request(OP.THREAD_CREATE_RAW, payload).then(bytes => {
+      if (bytes.length !== 24) throw fail('E_PROTOCOL', 'civshim THREAD_CREATE_RAW reply is not 24 bytes');
+      return {
+        handle: Number(bytes.readBigUInt64LE()),
+        createResult: Number(bytes.readBigUInt64LE(8)),
+        startResult: Number(bytes.readBigUInt64LE(16))
+      };
+    });
+  }
+
+  // Single-shot svcWaitSynchronization on one handle; the host drives the
+  // poll loop. Resolves {result, index}: result 0 = signaled, 0xEA01 (59905)
+  // = kernel wait timeout — poll again; other codes are the caller's to judge.
+  threadWait(handle, timeoutNs = 0) {
+    const payload = Buffer.concat([u64le(handle), u64le(exactInteger(timeoutNs, 'wait timeout'))]);
+    return this.request(OP.THREAD_WAIT, payload).then(bytes => {
+      if (bytes.length !== 16) throw fail('E_PROTOCOL', 'civshim THREAD_WAIT reply is not 16 bytes');
+      return {result: Number(bytes.readBigUInt64LE()), index: Number(bytes.readBigUInt64LE(8))};
+    });
+  }
+
+  threadClose(handle) {
+    return this.request(OP.THREAD_CLOSE, u64le(exactInteger(handle, 'raw thread handle')))
+      .then(bytes => {
+        if (bytes.length !== 8) throw fail('E_PROTOCOL', 'civshim THREAD_CLOSE reply is not 8 bytes');
+        return Number(bytes.readBigUInt64LE());
+      });
+  }
+
+  // Borrow a valid priority + usable-core mask from a live game thread via
+  // the on-console nn::os manager-list walk. Resolves
+  // {priority, coreMask, manager, nodes}.
+  threadSchedBorrow() {
+    return this.request(OP.THREAD_SCHED_BORROW).then(bytes => {
+      if (bytes.length !== 32) throw fail('E_PROTOCOL', 'civshim THREAD_SCHED_BORROW reply is not 32 bytes');
+      return {
+        priority: Number(bytes.readBigUInt64LE()),
+        coreMask: bytes.readBigUInt64LE(8),
+        manager: Number(bytes.readBigUInt64LE(16)),
+        nodes: Number(bytes.readBigUInt64LE(24))
+      };
+    });
+  }
+
   sleep(nanoseconds) {
     return this.request(OP.SLEEP, u64le(exactInteger(nanoseconds, 'sleep duration')));
   }
@@ -289,6 +348,14 @@ async function serve(connected) {
     if (command === 'thread-create')
       return {thread: await civshim.threadCreate(request.jbPtr)};
     if (command === 'thread-join') {await civshim.threadJoin(request.thread); return {joined: true};}
+    if (command === 'thread-create-raw')
+      return await civshim.threadCreateRaw(request.jbPtr, request.stackTop, request.priority, request.core);
+    if (command === 'thread-wait')
+      return await civshim.threadWait(request.thread, request.timeoutNs || 0);
+    if (command === 'thread-close')
+      return {result: await civshim.threadClose(request.thread)};
+    if (command === 'thread-sched-borrow')
+      return await civshim.threadSchedBorrow();
     if (command === 'sleep') {await civshim.sleep(request.ns); return {slept: true};}
     if (command === 'upd-offsets') return {merged: await civshim.updateOffsets(request.dict)};
     throw fail('E_ARGS', 'Unknown bridge command');

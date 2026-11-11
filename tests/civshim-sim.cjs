@@ -27,7 +27,8 @@ const SDK = 0x7100000000n, MAIN = 0x7000000000n;
 const IN_AREA = 64, OUT_AREA = 64 + 65536;
 const REQUEST_MAGIC = 0x43495631;
 const OP = {PING: 1, CALL: 2, READ: 3, WRITE: 4, QUERY: 5, ALLOC: 6, FREE: 7,
-  THREAD_CREATE: 8, THREAD_JOIN: 9, SLEEP: 10, UPD_OFFSETS: 11};
+  THREAD_CREATE: 8, THREAD_JOIN: 9, SLEEP: 10, UPD_OFFSETS: 11,
+  THREAD_CREATE_RAW: 12, THREAD_WAIT: 13, THREAD_CLOSE: 14, THREAD_SCHED_BORROW: 15};
 
 // ---- mailbox + scripted host -------------------------------------------------
 class HostSide {
@@ -180,8 +181,10 @@ async function main() {
       const text = trailer.toString('utf8').split('\0')[0];
       const dict = JSON.parse(text);
       assert.deepStrictEqual(Object.keys(dict).sort(), ['sdk_offsets', 'svc']);
-      assert.strictEqual(dict.svc.query_memory, null);
-      assert.strictEqual(dict.sdk_offsets.longjmp, null);
+      // barbarism: the trailer carries NON-NULL leaves only (the full key set
+      // no longer fits 256 bytes) — pre-M0 both groups are empty.
+      assert.deepStrictEqual(dict.svc, {});
+      assert.deepStrictEqual(dict.sdk_offsets, {});
     });
 
     // -- ops before the offsets upload (degraded mode) -------------------------
@@ -270,6 +273,12 @@ async function main() {
       assert.strictEqual((await readResponse(host)).status, 1);
       await host.writeChunk(frame(OP.THREAD_CREATE, nextId(), u64(scratch)));
       assert.strictEqual((await readResponse(host)).status, 1);
+      // barbarism: the raw-svc surface (ops 12-15) degrades identically.
+      const raw = Buffer.concat([u64(scratch + 0x400n), u64(scratch + 0x1000n), u32(43), u32(2)]);
+      await host.writeChunk(frame(OP.THREAD_CREATE_RAW, nextId(), raw));
+      assert.strictEqual((await readResponse(host)).status, 1);
+      await host.writeChunk(frame(OP.THREAD_SCHED_BORROW, nextId()));
+      assert.strictEqual((await readResponse(host)).status, 1);
     });
     await step('short QUERY payload rejected without killing the connection', async () => {
       await host.writeChunk(frame(OP.QUERY, nextId(), u32(1)));   // 4 bytes, must be 8
@@ -292,8 +301,13 @@ async function main() {
 
     // -- UPD_OFFSETS lifecycle --------------------------------------------------
     const upload = {svc: {query_memory: 0x1000, sleep_thread: 0x2000,
-      connect_to_named_service: 0x1100, send_sync_request: 0x1200},
-      sdk_offsets: {longjmp: 0x4000, pthread_create: 0x3000, pthread_join: 0x3100, pthread_exit: 0x3200},
+      connect_to_named_service: 0x1100, send_sync_request: 0x1200,
+      // barbarism: raw-svc thread surface (ops 12-15; kit thread-code.json)
+      close_handle: 0x5106, wait_synchronization: 0x5103,
+      create_thread: 0x5100, start_thread: 0x5101,
+      get_thread_priority: 0x5104, get_thread_core_mask: 0x5105},
+      sdk_offsets: {longjmp: 0x4000, pthread_create: 0x3000, pthread_join: 0x3100, pthread_exit: 0x3200,
+        thread_manager_global: 0x6000},
       modules: {main: {size: 38297600}, sdk: {size: 6160384}}};
     await step('UPD_OFFSETS: upload, merged reply, features go live', async () => {
       await host.writeChunk(frame(OP.UPD_OFFSETS, nextId(), Buffer.from(JSON.stringify(upload))));
@@ -335,6 +349,79 @@ async function main() {
       assert.strictEqual(BigInt(workerThread.thread), thread, 'reply echoes the slot pthread_t');
       await host.writeChunk(frame(OP.THREAD_JOIN, nextId(), u64(thread)));
       assert.strictEqual((await readResponse(host)).status, 0);
+    });
+
+    // -- raw-svc thread surface (ops 12-15; civswitch-kit hardware recipe) ----
+    await step('THREAD_SCHED_BORROW walks the manager list (priority/core mask)', async () => {
+      await host.writeChunk(frame(OP.THREAD_SCHED_BORROW, nextId()));
+      const reply = await readResponse(host);
+      assert.strictEqual(reply.status, 0, reply.payload.toString());
+      assert.strictEqual(reply.payload.readBigUInt64LE(0), 43n, 'borrowed priority');
+      assert.strictEqual(reply.payload.readBigUInt64LE(8), 0x4n, 'borrowed core mask');
+      const manager = reply.payload.readBigUInt64LE(16);
+      assert.ok(manager >= SDK && manager < SDK + 0x100000n, 'manager pointer in the sdk region');
+      assert.strictEqual(reply.payload.readBigUInt64LE(24), 1n, 'one node walked');
+    });
+    await step('THREAD_CREATE_RAW rejects an unaligned stack as bad request', async () => {
+      const payload = Buffer.concat([u64(scratch + 0x400n), u64(scratch + 0x801n), u32(43), u32(2)]);
+      await host.writeChunk(frame(OP.THREAD_CREATE_RAW, nextId(), payload));
+      assert.strictEqual((await readResponse(host)).status, 3);
+    });
+    await step('THREAD_CREATE_RAW reports kernel rejections as payload values', async () => {
+      // core 0 is the fake kernel's rejected core: OK status, createResult 0xE001,
+      // handle 0 — the host's retry-loop contract.
+      const stackTop = 0x5001000000n + 0x14000n; // fixed page-aligned guest stack
+      const payload = Buffer.concat([u64(scratch + 0x400n), u64(stackTop), u32(43), u32(0)]);
+      await host.writeChunk(frame(OP.THREAD_CREATE_RAW, nextId(), payload));
+      const reply = await readResponse(host);
+      assert.strictEqual(reply.status, 0);
+      assert.strictEqual(reply.payload.length, 24);
+      assert.strictEqual(reply.payload.readBigUInt64LE(0), 0n, 'no handle');
+      assert.strictEqual(reply.payload.readBigUInt64LE(8), 0xe001n, 'createResult 0xE001');
+    });
+    let rawHandle = 0n;
+    await step('THREAD_CREATE_RAW success (entry=longjmp, arg=jb, priority, core)', async () => {
+      const jb = scratch + 0x400n, stackTop = 0x5001000000n + 0x14000n;
+      const payload = Buffer.concat([u64(jb), u64(stackTop), u32(43), u32(2)]);
+      await host.writeChunk(frame(OP.THREAD_CREATE_RAW, nextId(), payload));
+      const reply = await readResponse(host);
+      assert.strictEqual(reply.status, 0, reply.payload.toString());
+      rawHandle = reply.payload.readBigUInt64LE(0);
+      assert.ok(rawHandle > 0n && rawHandle < 0xffff8000n, 'kernel handle');
+      assert.strictEqual(reply.payload.readBigUInt64LE(8), 0n, 'createResult 0');
+      assert.strictEqual(reply.payload.readBigUInt64LE(16), 0n, 'startResult 0');
+      requestInspect();
+      const state = await host.waitFor(m => m.type === 'inspect', 5000, 'inspect');
+      const created = state.rawThreads.at(-1);
+      assert.strictEqual(BigInt(created.entry), SDK + 0x4000n, 'entry = longjmp');
+      assert.strictEqual(BigInt(created.arg), jb, 'argument = frame base');
+      assert.strictEqual(BigInt(created.stackTop), stackTop, 'stack top forwarded');
+      assert.strictEqual(created.priority, '43');
+      assert.strictEqual(created.core, '2');
+    });
+    await step('THREAD_WAIT: 0xEA01 first poll, signaled second (0, index 0)', async () => {
+      await host.writeChunk(frame(OP.THREAD_WAIT, nextId(),
+        Buffer.concat([u64(rawHandle), u64(0n)])));
+      const first = await readResponse(host);
+      assert.strictEqual(first.status, 0);
+      assert.strictEqual(first.payload.readBigUInt64LE(0), 0xea01n, 'kernel wait timeout');
+      await host.writeChunk(frame(OP.THREAD_WAIT, nextId(),
+        Buffer.concat([u64(rawHandle), u64(0n)])));
+      const second = await readResponse(host);
+      assert.strictEqual(second.status, 0);
+      assert.strictEqual(second.payload.readBigUInt64LE(0), 0n, 'signaled');
+      assert.strictEqual(second.payload.readBigUInt64LE(8), 0n, 'index 0');
+    });
+    await step('THREAD_WAIT rejects non-handles as bad request', async () => {
+      await host.writeChunk(frame(OP.THREAD_WAIT, nextId(),
+        Buffer.concat([u64(0n), u64(0n)])));
+      assert.strictEqual((await readResponse(host)).status, 3);
+    });
+    await step('THREAD_CLOSE returns the svcCloseHandle result', async () => {
+      await host.writeChunk(frame(OP.THREAD_CLOSE, nextId(), u64(rawHandle)));
+      const reply = await readResponse(host);
+      assert.strictEqual(reply.status, 0);
+      assert.strictEqual(reply.payload.readBigUInt64LE(), 0n);
     });
     await step('UPD_OFFSETS: null never downgrades a live value', async () => {
       await host.writeChunk(frame(OP.UPD_OFFSETS, nextId(), Buffer.from(JSON.stringify({svc: {query_memory: null}}))));

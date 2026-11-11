@@ -59,6 +59,34 @@ Civilization 7 (Switch-1 cartridge 1.0.0)
                                  for this project, but they are not
                                  license-isolated from what they run against
                                  and link to at runtime.
+            └── civswitch-kit  —  mza1010 (https://gitee.com/mza1010/civswitch-kit)
+                │         **GPL-2.0** (whole package). The public CN kit that
+                │         proved the Civ 7 1.0.0 → fs exploit → firmware-dump
+                │         chain end-to-end (RUN 38, dump 90/90). It contains
+                │         the slapah/CivSwitch fork's ns2jb-port layer
+                │         (baseline commit 7d422e52; the fork itself is not
+                │         publicly fetchable) plus 8 documented patches.
+                └── BarbarismJB 2026-11-11 integration  ← three inputs:
+                         (1) **Offset values and hardware facts** (svc wrapper
+                             offsets, thread-manager layout, jmp_buf shape,
+                             Civ7-BC fs geometry constants) imported into
+                             offsets/civ7-100.json by engine/carrier/civ7js/
+                             import-civswitch-offsets.cjs — every leaf carries
+                             its kit source in the file's `_civswitch` block.
+                         (2) **Design-derived code**: civshim ops 12-15
+                             (raw svcCreateThread/StartThread/WaitSynchronization/
+                             CloseHandle + the manager-list scheduling borrow)
+                             and the `rawsvc` worker backend implement the
+                             kit's hardware-qualified recipes
+                             (port/engine/switch2/app/native-worker.cjs,
+                             port/civ7-app/thread-code.json) in original code.
+                         (3) **Wire behavior** of the :9026 loader
+                             (send → half-close → log stream), reimplemented
+                             in engine/carrier/civ7js/loader-client.cjs from
+                             the kit's save-tools/send_js.py semantics.
+                         GPL-2.0 obligations: code and imported data under
+                         (2)+(3) must travel with this notice and the kit
+                         attribution; do not strip them.
 ```
 
 Third-party analysis tooling vendored under `tools/` (untouched, their own
@@ -110,8 +138,10 @@ handling rules (keys stay outside this repository).
 
 | component | origin |
 |---|---|
-| `payloads/civshim.js` | original (protocol design + implementation), runs against GPL-lineage primitives |
+| `payloads/civshim.js` | original (protocol design + implementation), runs against GPL-lineage primitives; ops 12-15 implement the civswitch-kit raw-svc recipes (GPL-2.0 design lineage, original code) |
 | `payloads/dumper.js` | original |
+| `engine/carrier/civ7js/` | original; loader wire behavior + kit table mapping derived from the GPL-2.0 civswitch-kit (see the derivation tree above); the imported offset values are kit output |
+| `engine/switch2/app/{native-worker,worker}.cjs` `rawsvc` backend | original code implementing the kit's hardware-qualified raw-svcCreateThread worker path |
 | `engine/lib/{connection,bridge,offsets}.cjs` | adapted from ns2jb (`lib/` transport replaced; offsets loader new) |
 | `engine/shared/{config,errors,log,version}.cjs` | new for this port |
 | `engine/shared/frames.cjs` (`buildRop`) | new ropchain backend alongside the verbatim ns2jb `build()` |
@@ -119,7 +149,7 @@ handling rules (keys stay outside this repository).
 | `run.cjs` | adapted from ns2jb `run.cjs` |
 | `tools/{dump_recv,svc_scan,gadget_scan,make_test_nso}.py` | original (stdlib-only) |
 | `tests/*` | original |
-| `DESIGN.md`, `README.md`, `docs/FIRMWARE.md`, `offsets/*` | original documentation |
+| `DESIGN.md`, `README.md`, `docs/CIVSWITCH-INTEGRATION.md`, `docs/CIVSWITCH-RUNBOOK.md`, `docs/FIRMWARE.md`, `offsets/*` | original documentation (the integration map + runbook cite the GPL-2.0 civswitch-kit as their source; `offsets/civ7-100.json` carries the kit's values with per-leaf provenance) |
 
 ## Historical note
 

@@ -2,12 +2,18 @@
 // native wave workers through the configured backend.
 //
 // barbarism: Worker backends. 'frames' is the original ns2jb variable-size
-// SmileBASIC SDK worker frame machinery, kept byte-for-byte. 'ropchain' (the
-// default) is the Civ 7 backend: the host compiles each worker's call list
-// into a linear ROP chain plus a forged jmp_buf with shared/frames.cjs
-// buildRop(), WRITEs the buffer, then drives it through the civshim
-// THREAD CREATE / THREAD JOIN ops (pthread_create(&t, NULL, longjmp, jb)).
-// Protocol: payloads/civshim.js ops 8/9. Config: BARBARISM_WORKER.
+// SmileBASIC SDK worker frame machinery, kept byte-for-byte. 'ropchain' is the
+// pthread-backed Civ 7 backend (historical default — see below). 'rawsvc' is
+// the hardware-qualified Civ 7 backend: the same buildRop() chains and forged
+// jmp_buf, but launched through the civswitch-kit raw svcCreateThread path
+// (civshim ops 12-15) because pthread_create silently no-ops and
+// nn::os::CreateThread hangs on Civ 7 1.0.0 — docs/CIVSWITCH-INTEGRATION.md
+// §2c. The host compiles each worker's call list into a linear ROP chain plus
+// a forged jmp_buf with shared/frames.cjs buildRop(), WRITEs the buffer, then
+// drives it through the civshim THREAD CREATE / THREAD JOIN ops
+// (pthread_create(&t, NULL, longjmp, jb)).
+// Protocol: payloads/civshim.js ops 8/9 (ropchain), 12-15 (rawsvc).
+// Config: BARBARISM_WORKER.
 // Origin: ported from ns2jb engine/switch2/app/native-worker.cjs, adapted
 // for BarbarismJB — see `// barbarism:` markers.
 const fs = require('node:fs/promises');
@@ -22,6 +28,12 @@ const {build, buildRop} = require('../../shared/frames.cjs');
 
 const backend = config.workerBackend();
 const align = n => Math.ceil(n / 4096) * 4096;
+// barbarism: raw-svc constants from the civswitch-kit hardware run
+// (docs/CIVSWITCH-INTEGRATION.md §2c): 0x14000-byte raw stacks
+// (target.civ7.json thread.stackBytes 81920) and the kernel wait-sync timeout
+// result 0xEA01 (kit CHANGES.md patch 1 — 0xE901 was the author's typo).
+const RAW_STACK_BYTES = 0x14000;
+const RAW_WAIT_TIMEOUT = 59905;
 function capacity(calls) {
   const count = calls.reduce((n, call) => n + 1 + call.args.filter(a => typeof a === 'object').length, 0);
   return align(0x20000 + count * 0x300);
@@ -62,6 +74,11 @@ async function start(s, base, limit, slot, calls, label, snapshot = 0) {
   let built;
   if (backend === 'frames')
     built = build(base, live.sdk, calls, code);
+  else if (backend === 'rawsvc')
+    // barbarism: raw kernel threads have no musl TCB — the chain tail is the
+    // svc #0x0A wrapper (svc.exit_thread), never pthread_exit.
+    built = buildRop(base, {...live, workerExit: live.svc?.exit_thread}, calls,
+      ropContext().jmpBuf, ropContext().gadgets);
   else
     built = buildRop(base, live, calls, ropContext().jmpBuf, ropContext().gadgets);
   const {frame, proof} = built;
@@ -98,6 +115,51 @@ async function launch(s, prepared) {
     if (result) s.threads.delete(pending);
     check(!result, 'pthread_create failed: ' + result);
     thread = Number((await s.readOwned(slot, 8)).readBigUInt64LE());
+  } else if (backend === 'rawsvc') {
+    // barbarism: raw svcCreateThread launch — the civswitch-kit
+    // hardware-qualified path (nn::os::CreateThread hangs; pthread_create
+    // silently no-ops on Civ 7 1.0.0). Entry is longjmp with the forged
+    // jmp_buf/chain at base, exactly what their raw-thread frame probe
+    // validated. The stack is a dedicated game calloc (zeroed, disjoint from
+    // every arena — kit FINDINGS §2.2 rule), so it can never overlap the
+    // frame or snapshot.
+    if (!s.rawScheduling) {
+      const borrowed = await transport.request({command: 'thread-sched-borrow'});
+      check(Number.isSafeInteger(borrowed.priority) && borrowed.priority > 0 && borrowed.priority < 64,
+        'Invalid borrowed thread priority');
+      const cores = [];
+      const mask = BigInt(borrowed.coreMask);
+      for (let bit = 0n; bit < 64n; bit++) if ((mask >> bit) & 1n) cores.push(Number(bit));
+      check(cores.length, 'Borrowed thread core mask is empty');
+      s.rawScheduling = {priority: borrowed.priority, cores};
+      await s.record({operation: 'rawSchedulingBorrowed', priority: borrowed.priority,
+        cores, manager: borrowed.manager, nodes: borrowed.nodes});
+    }
+    let stack = prepared.rawStack;
+    if (!stack) {
+      stack = (await transport.request({command: 'alloc', size: RAW_STACK_BYTES})).address;
+      check(Number.isSafeInteger(stack) && stack > 0 && stack % 0x1000 === 0,
+        'Raw stack allocation is not page-aligned guest memory');
+    } else {
+      await s.rpc.write(stack, Buffer.alloc(RAW_STACK_BYTES)); // re-zero for a relaunch
+    }
+    prepared.rawStack = stack; // travels with the worker through restart()
+    const stackTop = stack + RAW_STACK_BYTES;
+    let created = null;
+    for (const core of s.rawScheduling.cores) {
+      const reply = await transport.request({command: 'thread-create-raw',
+        jbPtr: base, stackTop, priority: s.rawScheduling.priority, core});
+      if (reply.handle) {created = reply; break;}
+      check(reply.createResult === 0xe001,
+        'svcCreateThread failed: 0x' + (reply.createResult || reply.startResult || 0).toString(16));
+      await s.record({operation: 'rawThreadCreateAttempt', label, core, result: reply.createResult});
+    }
+    if (!created) s.threads.delete(pending);
+    check(created, 'svcCreateThread rejected every borrowed core');
+    thread = created.thread;
+    const stored = Buffer.alloc(8);
+    stored.writeBigUInt64LE(BigInt(thread));
+    await s.write(slot, stored);
   } else {
     // barbarism: civshim THREAD_CREATE — pthread_create(&slot, NULL, longjmp,
     // jb=base) driven on-console; the pthread_t comes back in the reply and is
@@ -109,7 +171,10 @@ async function launch(s, prepared) {
     stored.writeBigUInt64LE(BigInt(thread));
     await s.write(slot, stored);
   }
-  check(Number.isSafeInteger(thread) && thread > 0 && thread < 2 ** 39 && thread % 8 === 0, 'Invalid worker pointer');
+  if (backend === 'rawsvc')
+    check(Number.isSafeInteger(thread) && thread > 0 && thread < 0xffff8000, 'Invalid raw thread handle');
+  else
+    check(Number.isSafeInteger(thread) && thread > 0 && thread < 2 ** 39 && thread % 8 === 0, 'Invalid worker pointer');
   s.threads.delete(pending); s.threads.add(thread);
   const worker = {...prepared, thread, joined: false};
   check((await s.readOwned(base + worker.resultOffset, 8)).readBigUInt64LE() === SENTINEL, 'Worker passed its start gate');
@@ -143,6 +208,23 @@ async function join(s, worker, timeoutMs = 15000) {
       if (finished) break;
       await new Promise(resolve => setTimeout(resolve, 10));
     } while (Date.now() < until);
+  } else if (backend === 'rawsvc') {
+    // barbarism: poll the kernel handle with single-shot svcWaitSynchronization
+    // (civshim op 13). 0 = signaled; 0xEA01 = wait timeout (poll again — the
+    // kit's join poll, kit CHANGES.md patch 1); anything else is fatal. The
+    // host-side 10 ms pacing keeps the console JS thread free between polls.
+    const until = Date.now() + timeoutMs;
+    do {
+      const wait = await transport.request({command: 'thread-wait', thread: worker.thread, timeoutNs: 0});
+      check(wait.result === 0 || wait.result === RAW_WAIT_TIMEOUT,
+        'Unexpected wait-synchronization result: 0x' + wait.result.toString(16));
+      if (wait.result === 0) {
+        check(wait.index === 0, 'Wait signaled a different handle');
+        finished = 1;
+        break;
+      }
+      await new Promise(resolve => setTimeout(resolve, 10));
+    } while (Date.now() < until);
   } else {
     // barbarism: no tryjoin pin for Civ 7 yet, so join() blocks on-console inside
     // civshim THREAD_JOIN. The worker never re-enters the JS thread, so this
@@ -158,6 +240,10 @@ async function join(s, worker, timeoutMs = 15000) {
     check(!await s.rpc.call3(live.sdk + code.join.offset, worker.thread, worker.slot + 8, 0), 'pthread_join failed');
     check((await s.readOwned(worker.slot + 8, 8)).readBigUInt64LE() === values.at(-1), 'Thread exit result differs');
   }
+  if (backend === 'rawsvc') {
+    const closed = await transport.request({command: 'thread-close', thread: worker.thread});
+    check(!closed.result, 'svcCloseHandle failed: 0x' + (closed.result || 0).toString(16));
+  }
   s.threads.delete(worker.thread);
   worker.joined = true;
   worker.results = worker.logicalResultIndices.map(i => values[i]);
@@ -168,8 +254,12 @@ async function join(s, worker, timeoutMs = 15000) {
 
 // barbarism: park workers that are mid-chain (setup cancellation). The frames
 // backend overwrote the next dispatch-table entry with the SDK exit function;
-// the ropchain backend rewrites EVERY call cell to pthread_exit — already
-// executed cells are harmless, and a running worker exits at its next call.
+// the ropchain backend rewrites EVERY call cell to pthread_exit; the rawsvc
+// backend rewrites every cell to the svc #0x0A wrapper (svcExitThread) — a raw
+// kernel thread has no musl TCB, so pthread_exit would fault it (civswitch-kit
+// thread-code.json directNnOs.pthreadExit). svc #0x07 is svcExitProcess and
+// would kill the game. Already-executed cells are harmless; a running worker
+// exits at its next call.
 async function cancelAll(s, workers) {
   if (backend === 'frames') {
     for (const worker of workers)
@@ -177,8 +267,9 @@ async function cancelAll(s, workers) {
         worker.logicalResultIndices[1] * 0x100 + 0x78, BigInt(live.sdk + code.exit.offset));
     return;
   }
-  const exitAddress = live.sdkFn.pthread_exit;
-  check(Number.isSafeInteger(exitAddress) && exitAddress > 0, 'pthread_exit offset missing for cancellation');
+  const exitAddress = backend === 'rawsvc' ? live.svc.exit_thread : live.sdkFn.pthread_exit;
+  check(Number.isSafeInteger(exitAddress) && exitAddress > 0,
+    (backend === 'rawsvc' ? 'svc.exit_thread' : 'pthread_exit') + ' offset missing for cancellation');
   for (const worker of workers) {
     const count = worker.nativeCalls + 1;
     for (let index = 0; index < count; index++)
