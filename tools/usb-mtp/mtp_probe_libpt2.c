@@ -178,89 +178,210 @@ static int find_console(libusb_context *ctx, uint8_t *devnum,
 }
 
 /*
- * dev_open: mirror of LIBMTP_OpenDevice, INCLUDING libmtp's claim-retry
- * reality on macOS (icdd fights us): killall the trio and re-configure
- * until configure_usb_device succeeds. configure_usb_device re-finds the
- * device by bus/devnum internally, so each retry re-enumerates fresh.
+ * dev_open: LIBMTP_OpenDevice parity with macOS reality folded in.
+ *
+ * configure_usb_device's one-shot claim loses the icdd race on macOS
+ * (~150ms of enumeration work between our killall and its claim, and the
+ * respawned trio re-grabs in that window — python wins only because its
+ * killall->claim gap is exactly 120ms). So we mirror libmtp's flow with
+ * the claim under OUR control:
+ *
+ *   1. claim loop: killall trio + 120ms + libusb_open + claim (python
+ *      mtp_probe.py _claim parity, fresh handle per attempt).
+ *   2. init_ptp_usb parity: PTPParams zeroed (libmtp.c:1955+), the SAME
+ *      exported glue I/O callbacks, PTP_DL_LE, iconv UTF-16LE<->UTF-8.
+ *   3. the EXACT opensession tolerance block of libusb1-glue.c
+ *      configure_usb_device:2308-2352: short USB_START_TIMEOUT (5s) for
+ *      the first trial; PTP_ERROR_IO -> libusb_reset_device + full
+ *      re-claim + one retry; PTP_RC_InvalidTransactionID ->
+ *      transaction_id += 10 + retry; PTP_RC_SessionAlreadyOpened
+ *      ACCEPTED; then timeout restored to 20s.
  */
-static int dev_open(Dev *d)
+#define USB_START_TIMEOUT_C 5000
+#define USB_TIMEOUT_DEFAULT_C 20000
+
+/* one claim attempt: fresh libusb handle + endpoints + interface claim.
+ * Returns 0 with d filled (d->open==2, sessionless) or -1 (nothing held).
+ * Shared by dev_open and bare_open — same code path, no drift. */
+static int open_claimed(Dev *d)
 {
     libusb_context *ctx = NULL;
-    uint8_t devnum = 0, busnum = 0;
-    int attempt;
+    libusb_device **list = NULL;
+    ssize_t n, i;
+    libusb_device_handle *h = NULL;
+    struct libusb_config_descriptor *cfg = NULL;
+    const struct libusb_interface_descriptor *ifc;
+    PTPParams *p;
+    PTP_USB *u;
+    int k, dev_found = 0;
 
     memset(d, 0, sizeof(*d));
-    if (libusb_init(&ctx) != LIBUSB_SUCCESS) {
-        fprintf(stderr, "libusb_init failed\n");
-        return -1;
-    }
-
-    for (attempt = 0; attempt < 8; attempt++) {
-        void *usbinfo = NULL;
-        LIBMTP_error_number_t err;
-        PTPParams *p = &d->params;
-
-        kill_imaging_trio();
-        usleep(120000);
-        /* grace window: post-reset re-enumeration can take ~1s */
-        if (!find_console(ctx, &devnum, &busnum, attempt ? 2000 : 500)) {
-            jr("stage\":\"dev_open\",\"detail\":\"device not enumerated\","
-               "\"attempt\":%d", attempt);
-            continue;
+    if (libusb_init(&ctx) != LIBUSB_SUCCESS) return -1;
+    d->_bare_ctx = ctx;
+    n = libusb_get_device_list(ctx, &list);
+    for (i = 0; i < n; i++) {
+        struct libusb_device_descriptor dd;
+        if (libusb_get_device_descriptor(list[i], &dd) == LIBUSB_SUCCESS &&
+            dd.idVendor == VID && dd.idProduct == PID) {
+            dev_found = 1;
+            if (libusb_open(list[i], &h) == LIBUSB_SUCCESS) break;
         }
-        /* == LIBMTP_OpenDevice's PTPParams setup (libmtp.c:1955+) == */
-        memset(p, 0, sizeof(*p));
-        p->device_flags = 0;
-        p->nrofobjects = 0;
-        p->cachetime = 2;
-        p->objects = NULL;
-        p->response_packet_size = 0;
-        p->response_packet = NULL;
-        p->data = NULL;
-        p->debug_func = NULL;
-        p->error_func = NULL;
-        p->byteorder = PTP_DL_LE;
-        p->cd_locale_to_ucs2 = iconv_open("UTF-16LE", "UTF-8");
-        p->cd_ucs2_to_locale = iconv_open("UTF-8", "UTF-16LE");
-        if (p->cd_locale_to_ucs2 == (iconv_t)-1 ||
-            p->cd_ucs2_to_locale == (iconv_t)-1) {
-            fprintf(stderr, "iconv_open failed\n");
+    }
+    libusb_free_device_list(list, 1);
+    if (!dev_found) { jr("open\":\"device not enumerated\""); goto fail; }
+    if (!h) { jr("open\":\"libusb_open failed\""); goto fail; }
+    if (libusb_get_active_config_descriptor(libusb_get_device(h), &cfg)
+        != LIBUSB_SUCCESS) { jr("open\":\"no config descriptor\""); goto fail; }
+    ifc = &cfg->interface[0].altsetting[0];
+    u = (PTP_USB *)calloc(1, sizeof(PTP_USB));
+    u->handle = h;
+    u->interface = 0;
+    u->timeout = USB_TIMEOUT_DEFAULT_C;
+    for (k = 0; k < ifc->bNumEndpoints; k++) {
+        const struct libusb_endpoint_descriptor *e = &ifc->endpoint[k];
+        int dir = e->bEndpointAddress & 0x80;
+        int type = e->bmAttributes & 3;
+        if (type == LIBUSB_TRANSFER_TYPE_BULK) {
+            if (dir == LIBUSB_ENDPOINT_IN) {
+                u->inep = e->bEndpointAddress;
+                u->inep_maxpacket = e->wMaxPacketSize;
+            } else {
+                u->outep = e->bEndpointAddress;
+                u->outep_maxpacket = e->wMaxPacketSize;
+            }
+        }
+    }
+    libusb_free_config_descriptor(cfg);
+    if (!u->inep || !u->outep) { jr("open\":\"no bulk pair\""); free(u); goto fail; }
+    if (libusb_claim_interface(h, 0) != LIBUSB_SUCCESS) {
+        jr("open\":\"claim failed (trio race)\"");
+        free(u);
+        goto fail;
+    }
+    /* == init_ptp_usb parity (libusb1-glue.c:1900+) == */
+    p = &d->params;
+    memset(p, 0, sizeof(*p));
+    p->sendreq_func = ptp_usb_sendreq;     /* exported by glue.o */
+    p->senddata_func = ptp_usb_senddata;
+    p->getresp_func = ptp_usb_getresp;
+    p->getdata_func = ptp_usb_getdata;
+    p->cancelreq_func = ptp_usb_control_cancel_request;
+    p->devstatreq_func = ptp_usb_control_device_status_request;
+    p->data = u;
+    p->transaction_id = 0;
+    p->byteorder = PTP_DL_LE;
+    p->cd_locale_to_ucs2 = iconv_open("UTF-16LE", "UTF-8");
+    p->cd_ucs2_to_locale = iconv_open("UTF-8", "UTF-16LE");
+    d->ptp_usb = u;
+    d->open = 2;                           /* claimed, sessionless */
+    return 0;
+fail:
+    if (h) libusb_close(h);
+    libusb_exit(ctx);
+    memset(d, 0, sizeof(*d));
+    return -1;
+}
+
+static void dev_close(Dev *d);
+
+/* libusb1-glue.c:2308-2352 opensession tolerance, verbatim semantics */
+static int opensession_with_tolerance(Dev *d)
+{
+    uint16_t ret;
+    PTPParams *p = &d->params;
+
+    d->ptp_usb->timeout = USB_START_TIMEOUT_C;   /* short first-trial timeout */
+    ret = ptp_opensession(p, 1);
+    if (ret == PTP_ERROR_IO) {
+        jr("opensession\":\"PTP_ERROR_IO — reset + re-claim + retry "
+           "(libmtp path)\"");
+        libusb_reset_device(d->ptp_usb->handle);
+        libusb_release_interface(d->ptp_usb->handle, d->ptp_usb->interface);
+        libusb_close(d->ptp_usb->handle);
+        if (d->_bare_ctx) libusb_exit(d->_bare_ctx);
+        if (p->cd_locale_to_ucs2 != (iconv_t)-1)
+            iconv_close(p->cd_locale_to_ucs2);
+        if (p->cd_ucs2_to_locale != (iconv_t)-1)
+            iconv_close(p->cd_ucs2_to_locale);
+        {
+            int tries;
+            for (tries = 0; tries < 8; tries++) {
+                kill_imaging_trio();
+                usleep(120000);
+                if (open_claimed(d) == 0) break;
+            }
+            if (d->open != 2) {
+                jr("opensession\":\"re-claim after reset failed\"");
+                return -1;
+            }
+        }
+        /* device reset: wait for re-enumeration before retrying */
+        usleep(500000);
+        d->ptp_usb->timeout = USB_START_TIMEOUT_C;
+        ret = ptp_opensession(p, 1);
+        if (ret == PTP_ERROR_IO) {
+            jr("opensession\":\"PTP_ERROR_IO on second attempt (libmtp "
+               "gives up here)\"");
             return -1;
         }
-        memset(&d->raw, 0, sizeof(d->raw));
-        d->raw.device_entry.vendor = (char *)"Nintendo";
-        d->raw.device_entry.vendor_id = VID;
-        d->raw.device_entry.product = (char *)"Switch 2 capmtp";
-        d->raw.device_entry.product_id = PID;
-        d->raw.device_entry.device_flags = 0;
-        d->raw.bus_location = busnum;
-        d->raw.devnum = devnum;
-
-        /* the REAL libmtp configure+opensession (tolerates
-         * SessionAlreadyOpened; retries on IO error with usb reset) */
-        err = configure_usb_device(&d->raw, p, &usbinfo);
-        if (err == LIBMTP_ERROR_NONE && usbinfo) {
-            d->ptp_usb = (PTP_USB *)usbinfo;
-            d->ptp_usb->params = p;       /* libmtp.c does this right after */
-            d->open = 1;
-            jr("stage\":\"dev_open\",\"detail\":\"configure_usb_device ok\","
-               "\"attempt\":%d,\"session_txid\":%u",
-               attempt, (unsigned)p->transaction_id);
-            return 0;
-        }
-        jr("stage\":\"dev_open\",\"detail\":\"configure failed\","
-           "\"attempt\":%d,\"err\":%d", attempt, (int)err);
     }
-    libusb_exit(ctx);
-    fprintf(stderr, "dev_open: could not configure the device (Image "
-            "Capture race? console in Copy-to-Computer mode?)\n");
+    if (ret == PTP_RC_InvalidTransactionID) {
+        jr("opensession\":\"InvalidTransactionID — +=10 and retry "
+           "(libmtp path)\"");
+        p->transaction_id += 10;
+        ret = ptp_opensession(p, 1);
+    }
+    if (ret != PTP_RC_SessionAlreadyOpened && ret != PTP_RC_OK) {
+        jr("opensession\":\"rejected 0x%04x\"", ret);
+        return -1;
+    }
+    if (ret == PTP_RC_SessionAlreadyOpened)
+        jr("opensession\":\"SessionAlreadyOpened tolerated (libmtp parity)");
+    d->ptp_usb->timeout = USB_TIMEOUT_DEFAULT_C; /* restore normal timeout */
+    return 0;
+}
+
+static int dev_open(Dev *d)
+{
+    int attempt;
+
+    for (attempt = 0; attempt < 8; attempt++) {
+        kill_imaging_trio();
+        usleep(120000);                    /* python _claim cadence */
+        if (open_claimed(d) == 0) {
+            jr("stage\":\"dev_open\",\"detail\":\"claim ok\",\"attempt\":%d",
+               attempt);
+            if (opensession_with_tolerance(d) == 0) {
+                d->open = 1;               /* claimed + sessioned */
+                return 0;
+            }
+            /* session failed: release and retry the whole cycle */
+            dev_close(d);
+            continue;
+        }
+        jr("stage\":\"dev_open\",\"detail\":\"claim failed\",\"attempt\":%d",
+           attempt);
+    }
+    fprintf(stderr, "dev_open: could not open the device (Image Capture "
+            "race? console in Copy-to-Computer mode?)\n");
     return -1;
 }
 
 static void dev_close(Dev *d)
 {
     if (!d->open) return;
-    close_device(d->ptp_usb, &d->params);   /* release + libusb_close */
+    if (d->open == 2 || d->open == 1) {    /* our own claim in both cases */
+        libusb_release_interface(d->ptp_usb->handle, d->ptp_usb->interface);
+        libusb_close(d->ptp_usb->handle);
+        if (d->_bare_ctx) libusb_exit(d->_bare_ctx);
+        if (d->params.cd_locale_to_ucs2 != (iconv_t)-1)
+            iconv_close(d->params.cd_locale_to_ucs2);
+        if (d->params.cd_ucs2_to_locale != (iconv_t)-1)
+            iconv_close(d->params.cd_ucs2_to_locale);
+        memset(d, 0, sizeof(*d));
+        return;
+    }
+    close_device(d->ptp_usb, &d->params);   /* legacy configure path */
     if (d->params.cd_locale_to_ucs2 != (iconv_t)-1)
         iconv_close(d->params.cd_locale_to_ucs2);
     if (d->params.cd_ucs2_to_locale != (iconv_t)-1)
@@ -745,75 +866,18 @@ static void corpus_init(void)
 /* (own libusb open + claim + the exported glue I/O callbacks), because */
 /* configure_usb_device itself dies at opensession once zombied.        */
 
-/* bare sessionless open: our own claim + the glue's I/O callbacks */
+/* bare sessionless open: killall + claim, NO session (for the
+ * --probe-zombie-recovery sessionless candidates). Same open_claimed
+ * path the sessioned dev_open uses — one code path, no drift. */
 static int bare_open(Dev *d)
 {
-    libusb_context *ctx = NULL;
-    libusb_device **list = NULL;
-    ssize_t n, i;
-    libusb_device_handle *h = NULL;
-    struct libusb_config_descriptor *cfg = NULL;
-    const struct libusb_interface_descriptor *ifc;
-    PTPParams *p;
-    PTP_USB *u;
-    int k;
-
-    memset(d, 0, sizeof(*d));
-    if (libusb_init(&ctx) != LIBUSB_SUCCESS) return -1;
-    d->_bare_ctx = ctx;
-    n = libusb_get_device_list(ctx, &list);
-    for (i = 0; i < n; i++) {
-        struct libusb_device_descriptor dd;
-        if (libusb_get_device_descriptor(list[i], &dd) == LIBUSB_SUCCESS &&
-            dd.idVendor == VID && dd.idProduct == PID) {
-            if (libusb_open(list[i], &h) == LIBUSB_SUCCESS) break;
-        }
+    kill_imaging_trio();
+    usleep(120000);
+    if (open_claimed(d) == 0) {
+        jr("bare_open\":\"ok (sessionless, own claim)\"");
+        return 0;
     }
-    libusb_free_device_list(list, 1);
-    if (!h) { jr("bare_open\":\"no device\""); goto fail; }
-    if (libusb_get_active_config_descriptor(libusb_get_device(h), &cfg)
-        != LIBUSB_SUCCESS) { jr("bare_open\":\"no config descriptor\""); goto fail; }
-    ifc = &cfg->interface[0].altsetting[0];
-    u = (PTP_USB *)calloc(1, sizeof(PTP_USB));
-    u->handle = h;
-    u->interface = 0;
-    u->timeout = 20000;
-    for (k = 0; k < ifc->bNumEndpoints; k++) {
-        const struct libusb_endpoint_descriptor *e = &ifc->endpoint[k];
-        int dir = e->bEndpointAddress & 0x80;
-        int type = e->bmAttributes & 3;
-        if (type == LIBUSB_TRANSFER_TYPE_BULK) {
-            if (dir == LIBUSB_ENDPOINT_IN) {
-                u->inep = e->bEndpointAddress;
-                u->inep_maxpacket = e->wMaxPacketSize;
-            } else {
-                u->outep = e->bEndpointAddress;
-                u->outep_maxpacket = e->wMaxPacketSize;
-            }
-        }
-    }
-    libusb_free_config_descriptor(cfg);
-    if (!u->inep || !u->outep) { jr("bare_open\":\"no bulk pair\""); free(u); goto fail; }
-    if (libusb_claim_interface(h, 0) != LIBUSB_SUCCESS) {
-        jr("bare_open\":\"claim failed\""); free(u); goto fail;
-    }
-    p = &d->params;
-    memset(p, 0, sizeof(*p));
-    p->sendreq_func = ptp_usb_sendreq;   /* exported by glue.o */
-    p->senddata_func = ptp_usb_senddata;
-    p->getresp_func = ptp_usb_getresp;
-    p->getdata_func = ptp_usb_getdata;
-    p->data = u;
-    p->byteorder = PTP_DL_LE;
-    p->cd_locale_to_ucs2 = iconv_open("UTF-16LE", "UTF-8");
-    p->cd_ucs2_to_locale = iconv_open("UTF-8", "UTF-16LE");
-    d->ptp_usb = u;
-    d->open = 2;                          /* bare: close path differs */
-    jr("bare_open\":\"ok (sessionless, own claim)\"");
-    return 0;
-fail:
-    if (h) libusb_close(h);
-    libusb_exit(ctx);
+    jr("bare_open\":\"claim failed\"");
     return -1;
 }
 
