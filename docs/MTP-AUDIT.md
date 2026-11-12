@@ -67,3 +67,20 @@ silent) — its container writer is itself an unaudited parser below the parser.
 - **usbsys.bin audit DISPATCHED** (device-mode data path, 0x2FF synthesizer,
   transfer-ring counterpart, memory-safety of the bulk-stream parser — the
   Path-to-userland verdict for the USB lane).
+
+## RESOLUTION (2026-11-12): the "0x2FF synthesizer" is OUR OWN HOST LIBRARY
+
+The mystery codes were never console-authored. libptp2 (the library inside
+libmtp, which our C prober links) defines pseudo-codes in ptp.h:1126-1132:
+0x2F9 NODEVICE, 0x2FA TIMEOUT, 0x2FB CANCEL, 0x2FC BADPARAM,
+0x2FD RESP_EXPECTED, 0x2FE DATA_EXPECTED, 0x2FF IO. Its glue
+(libusb1-glue.c:1775-1790) maps USB-layer failures to them:
+TIMED_OUT->0x2FA, CANCELLED->0x2FB, STALL->0x2FE,
+ERROR/NO_DEVICE/OVERFLOW->0x2FF; a response-where-data-expected also
+yields 0x2FE (:1429). The "20-second timer" is USB_TIMEOUT_DEFAULT=20000ms
+in the same glue. Every observed code decodes: clean-state GetNumObjects
+0x2FE = DATA_EXPECTED; zombie 0x2FF = the IO mapping of the dead OUT
+endpoint; fast-vs-late = STALL-vs-wait. The console-side reality that
+survives: the engine latch (EP0 CANCEL gate) and Phase-B endpoint death are
+real console behavior; the "hidden synthesizer module" does not exist.
+MTP lane = persistent-DoS class only. Struck from the live-lead list.
